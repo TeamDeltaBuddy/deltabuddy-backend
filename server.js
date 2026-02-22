@@ -215,6 +215,32 @@ app.get('/api/news', async (req, res) => {
   }
 });
 
+// ── Telegram Proxy ────────────────────────────────────────────────────────────
+// Bot token lives ONLY here as env var — never exposed to frontend users
+app.post('/api/telegram', async (req, res) => {
+  const BOT_TOKEN = process.env.TG_BOT_TOKEN;
+  if (!BOT_TOKEN) return res.status(503).json({ error: 'TG_BOT_TOKEN not set on server' });
+
+  const { chat_id, text, parse_mode = 'HTML' } = req.body;
+  if (!chat_id || !text) return res.status(400).json({ error: 'chat_id and text required' });
+
+  try {
+    const response = await fetch(
+      `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
+      {
+        method : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body   : JSON.stringify({ chat_id, text, parse_mode, disable_web_page_preview: true }),
+      }
+    );
+    const data = await response.json();
+    if (!data.ok) return res.status(400).json({ error: data.description || 'Telegram error' });
+    res.json({ ok: true });
+  } catch(err) {
+    res.status(502).json({ error: 'Telegram proxy failed', detail: err.message });
+  }
+});
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n🚀 DeltaBuddy Backend running on port ${PORT}`);

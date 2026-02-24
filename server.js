@@ -70,7 +70,7 @@ async function angelLogin() {
     while (totpSecret.length % 8 !== 0) totpSecret += '=';
     
     // Allow ±1 window (30s tolerance for server clock drift)
-    totp.options = { digits: 6, step: 30, window: 1, algorithm: 'SHA1' };
+    totp.options = { digits: 6, step: 30, window: 1, algorithm: 'sha1' };
     const totpCode = totp.generate(totpSecret);
     console.log(`[Angel] Logging in as ${ANGEL_CLIENT_ID}, TOTP=${totpCode}, secret_len=${totpSecret.length}...`);
 

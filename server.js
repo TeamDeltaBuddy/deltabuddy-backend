@@ -55,16 +55,24 @@ const MODE_QUOTE     = 2;  // LTP + bid/ask + volume
 const MODE_SNAPQUOTE = 3;  // Full market depth (5 levels)
 
 // ── Angel One Login ───────────────────────────────────────────────────────────
+let angelLoginError = '';
+
 async function angelLogin() {
   if (!ANGEL_API_KEY || !ANGEL_CLIENT_ID || !ANGEL_MPIN || !ANGEL_TOTP_KEY) {
-    console.log('[Angel] Missing credentials — skipping login');
+    angelLoginError = 'Missing env vars';
+    console.log('[Angel] Missing credentials — need ANGEL_API_KEY, ANGEL_CLIENT_ID, ANGEL_MPIN, ANGEL_TOTP_KEY');
     return false;
   }
 
   try {
-    totp.options = { digits: 6, step: 30 };
-    const totpCode = totp.generate(ANGEL_TOTP_KEY);
-    console.log(`[Angel] Logging in as ${ANGEL_CLIENT_ID}...`);
+    // Add base32 padding if missing (Angel One secret may not have = padding)
+    let totpSecret = ANGEL_TOTP_KEY.replace(/\s/g, '').toUpperCase();
+    while (totpSecret.length % 8 !== 0) totpSecret += '=';
+    
+    // Allow ±1 window (30s tolerance for server clock drift)
+    totp.options = { digits: 6, step: 30, window: 1, algorithm: 'SHA1' };
+    const totpCode = totp.generate(totpSecret);
+    console.log(`[Angel] Logging in as ${ANGEL_CLIENT_ID}, TOTP=${totpCode}, secret_len=${totpSecret.length}...`);
 
     const res = await fetch('https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword', {
       method : 'POST',
@@ -74,31 +82,37 @@ async function angelLogin() {
         'X-UserType'      : 'USER',
         'X-SourceID'      : 'WEB',
         'X-ClientLocalIP' : '127.0.0.1',
-        'X-ClientPublicIP': '127.0.0.1',
-        'X-MACAddress'    : '00:00:00:00:00:00',
+        'X-ClientPublicIP': '106.51.0.1',
+        'X-MACAddress'    : 'AA:BB:CC:DD:EE:FF',
         'X-PrivateKey'    : ANGEL_API_KEY,
       },
       body: JSON.stringify({
         clientcode: ANGEL_CLIENT_ID,
         password  : ANGEL_MPIN,
         totp      : totpCode,
-      }),
+      }), // totp is 6-digit code
       timeout: 15000,
     });
 
-    const data = await res.json();
+    const raw = await res.text();
+    console.log(`[Angel] Login response (${res.status}):`, raw.substring(0, 300));
+
+    const data = JSON.parse(raw);
     if (data.status && data.data?.jwtToken) {
-      angelToken     = data.data.jwtToken;
-      angelFeedToken = data.data.feedToken;
-      angelLoginTime = Date.now();
-      console.log('[Angel] Login successful ✅');
+      angelToken      = data.data.jwtToken;
+      angelFeedToken  = data.data.feedToken;
+      angelLoginTime  = Date.now();
+      angelLoginError = '';
+      console.log('[Angel] ✅ Login successful! feedToken:', angelFeedToken?.substring(0,20) + '...');
       return true;
     } else {
-      console.error('[Angel] Login failed:', data.message || JSON.stringify(data));
+      angelLoginError = data.message || data.errorcode || JSON.stringify(data);
+      console.error('[Angel] ❌ Login failed:', angelLoginError);
       return false;
     }
   } catch(e) {
-    console.error('[Angel] Login error:', e.message);
+    angelLoginError = e.message;
+    console.error('[Angel] ❌ Login exception:', e.message);
     return false;
   }
 }
@@ -324,12 +338,22 @@ setInterval(async () => {
 // GET /api/angel/status — connection status
 app.get('/api/angel/status', (req, res) => {
   res.json({
-    connected    : angelConnected,
-    tokenCount   : Object.keys(tickStore).length,
+    connected       : angelConnected,
+    tokenCount      : Object.keys(tickStore).length,
     subscribedTokens: [...subscribedTokens],
-    loginTime    : angelLoginTime,
-    hasCredentials: !!ANGEL_API_KEY,
+    loginTime       : angelLoginTime,
+    loginError      : angelLoginError || null,
+    hasCredentials  : !!ANGEL_API_KEY,
+    apiKey          : ANGEL_API_KEY ? ANGEL_API_KEY.substring(0,4)+'...' : null,
+    clientId        : ANGEL_CLIENT_ID || null,
   });
+});
+
+// GET /api/angel/relogin — force re-login for debugging
+app.get('/api/angel/relogin', async (req, res) => {
+  const ok = await angelLogin();
+  if (ok) connectAngelWS();
+  res.json({ ok, error: angelLoginError || null, connected: angelConnected });
 });
 
 // GET /api/angel/ticks — all latest ticks

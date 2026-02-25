@@ -601,6 +601,24 @@ app.post('/api/telegram', async (req, res) => {
   } catch(e) { res.status(502).json({ error: 'Telegram failed', detail: e.message }); }
 });
 
+// ── F&O Ban List ───────────────────────────────────────────────────────────────
+app.get('/api/nse/fno-ban', async (req, res) => {
+  try {
+    const url = 'https://www.nseindia.com/api/fo-banlist-securities';
+    const r = await fetch(url, { headers: { ...NSE_BASE_HEADERS, Cookie: await getNSECookies() } });
+    if (!r.ok) throw new Error(`NSE ban list ${r.status}`);
+    const data = await r.json();
+    // NSE returns array of strings or {symbol} objects
+    const securities = Array.isArray(data)
+      ? data.map(d => typeof d === 'string' ? d : d.symbol || d.tradingSymbol || JSON.stringify(d))
+      : (data.data || data.securities || []).map(d => typeof d === 'string' ? d : d.symbol || d.tradingSymbol || '');
+    res.json({ securities: securities.filter(Boolean), date: new Date().toISOString() });
+  } catch(e) {
+    // Return empty list gracefully — don't break the UI
+    res.json({ securities: [], error: e.message, date: new Date().toISOString() });
+  }
+});
+
 // ── Health ─────────────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
   res.json({

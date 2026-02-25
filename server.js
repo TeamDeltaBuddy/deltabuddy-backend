@@ -494,31 +494,68 @@ app.get('/api/quote', async (req, res) => {
 });
 
 // ── Yahoo Finance ──────────────────────────────────────────────────────────────
-const YAHOO_HEADERS = { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' };
+const YAHOO_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Accept': 'application/json, text/plain, */*',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Origin': 'https://finance.yahoo.com',
+  'Referer': 'https://finance.yahoo.com/',
+};
+
+// Helper: fetch one symbol — returns {price, change, prevClose} or null
+async function fetchYahooQuote(symbol) {
+  // Use range=5d so previousClose is always populated in meta
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=5d&includePrePost=false`;
+  try {
+    const r = await fetch(url, { headers: YAHOO_HEADERS });
+    if (!r.ok) return null;
+    const data = await r.json();
+    const meta = data?.chart?.result?.[0]?.meta;
+    if (!meta?.regularMarketPrice) return null;
+    const price     = meta.regularMarketPrice;
+    const prevClose = meta.chartPreviousClose || meta.previousClose || null;
+    // Calculate change from prevClose (most reliable)
+    let change = 0;
+    if (prevClose && prevClose > 0) {
+      change = parseFloat(((price - prevClose) / prevClose * 100).toFixed(2));
+    } else if (meta.regularMarketChangePercent) {
+      change = parseFloat(meta.regularMarketChangePercent.toFixed(2));
+    }
+    return { price: Math.round(price), change, prevClose: prevClose ? Math.round(prevClose) : null };
+  } catch(e) { return null; }
+}
 
 app.get('/api/yahoo/chart/:symbol', async (req, res) => {
   const { interval = '5m', range = '1d' } = req.query;
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(req.params.symbol)}?interval=${interval}&range=${range}`;
   try {
-    const r = await fetch(url, { headers: YAHOO_HEADERS, timeout: 10000 });
+    const r = await fetch(url, { headers: YAHOO_HEADERS });
     if (!r.ok) throw new Error(`Yahoo ${r.status}`);
     res.json(await r.json());
   } catch(e) { res.status(502).json({ error: 'Yahoo failed', detail: e.message }); }
 });
 
+// Batch price endpoint — returns price+change+prevClose for multiple symbols at once
+// Usage: GET /api/prices?symbols=RELIANCE.NS,TCS.NS,^NSEI
+app.get('/api/prices', async (req, res) => {
+  const { symbols } = req.query;
+  if (!symbols) return res.status(400).json({ error: 'symbols required' });
+  const list = symbols.split(',').map(s => s.trim()).filter(Boolean).slice(0, 40);
+  const results = {};
+  // Fetch in parallel, 8 at a time to avoid rate limits
+  const CHUNK = 8;
+  for (let i = 0; i < list.length; i += CHUNK) {
+    const chunk = list.slice(i, i + CHUNK);
+    const fetched = await Promise.all(chunk.map(sym => fetchYahooQuote(sym)));
+    chunk.forEach((sym, idx) => { if (fetched[idx]) results[sym] = fetched[idx]; });
+  }
+  res.json(results);
+});
+
 app.get('/api/yahoo/quote/:symbol', async (req, res) => {
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(req.params.symbol)}?interval=1d&range=1d`;
-  try {
-    const r = await fetch(url, { headers: YAHOO_HEADERS, timeout: 10000 });
-    if (!r.ok) throw new Error(`Yahoo ${r.status}`);
-    const data = await r.json();
-    const result = data?.chart?.result?.[0];
-    res.json({
-      price : result?.meta?.regularMarketPrice || null,
-      change: result?.meta?.regularMarketChangePercent || null,
-      symbol: req.params.symbol,
-    });
-  } catch(e) { res.status(502).json({ error: 'Yahoo quote failed', detail: e.message }); }
+  const data = await fetchYahooQuote(req.params.symbol);
+  if (!data) return res.status(502).json({ error: 'Yahoo quote failed' });
+  res.json({ ...data, symbol: req.params.symbol });
 });
 
 // ── Groq AI Proxy ──────────────────────────────────────────────────────────────

@@ -626,7 +626,8 @@ async function askAI(prompt, groqModel = 'llama3-8b-8192') {
   return null;
 }
 
-// ── ALERT ENGINE — RSS-based, no API key needed ────────────────────────────────
+// ── ALERT ENGINE — RSS-based, AI-first smart filtering ────────────────────────
+
 const RSS_FEEDS = [
   'https://feeds.feedburner.com/ndtvnews-top-stories',
   'https://timesofindia.indiatimes.com/rssfeedstopstories.cms',
@@ -636,22 +637,33 @@ const RSS_FEEDS = [
   'https://feeds.reuters.com/reuters/businessNews',
 ];
 
-// Keywords that matter for Indian markets
-const HIGH_IMPACT_KEYWORDS = [
+// First-pass filter — broad net to catch anything potentially relevant
+// This is NOT the final gate, just cuts obviously irrelevant noise before hitting AI
+const BROAD_RELEVANCE_KEYWORDS = [
+  // Indian market names
+  'nifty','sensex','nse','bse','rbi','sebi','india','indian',
+  // Heavy weights & sectors
+  'reliance','adani','tata','hdfc','infosys','wipro','ongc','sbi','icici','kotak',
+  'oil','crude','gas','bank','pharma','it sector','auto','fmcg','metal','infra',
+  // Macro
+  'rate','inflation','gdp','rupee','dollar','fed','powell','imf','world bank',
   // Geopolitical
-  'war','attack','strike','bomb','missile','invasion','conflict','sanction','iran','russia','china','pakistan','nato',
-  // Market moving
-  'rbi','rate cut','rate hike','repo rate','inflation','gdp','recession','fed reserve','powell','imf',
-  // Indian markets
-  'sebi','nse','bse','nifty','sensex','circuit','halt','ban','default','bankruptcy','scam','fraud',
-  // Commodities
-  'crude oil','oil price','gold price','rupee','dollar','forex',
-  // Corporate
-  'reliance','adani','tata','hdfc','infosys','wipro','ongc','earnings','quarterly results',
+  'war','attack','sanction','iran','russia','china','pakistan','opec','nato',
+  'oil supply','pipeline','export ban','import ban','trade',
+  // Market events
+  'crash','circuit','halt','fraud','scam','default','bankruptcy','shutdown',
+  'earnings','result','profit','loss','revenue','guidance','outlook',
 ];
 
-const sentAlerts = new Set(); // deduplicate — store headline hashes
-let alertsEnabled = true;
+// Hard skip — truly zero market relevance
+const DEFINITE_NOISE = [
+  'cricket','ipl','football','sports','film','bollywood','celebrity','wedding',
+  'recipe','travel','fashion','lifestyle','horoscope','weather forecast',
+  'covid vaccine','health tips','fitness','diet',
+];
+
+const sentAlerts  = new Set();
+let engineStarted = false;
 
 function hashStr(str) {
   let h = 0;
@@ -666,8 +678,7 @@ async function fetchRSSFeed(url) {
       timeout: 8000,
     });
     if (!r.ok) return [];
-    const xml = await r.text();
-    // Parse items from RSS XML
+    const xml  = await r.text();
     const items = [];
     const itemRegex = /<item>([\s\S]*?)<\/item>/g;
     let match;
@@ -677,17 +688,67 @@ async function fetchRSSFeed(url) {
       const description = (block.match(/<description[^>]*><!\[CDATA\[(.*?)\]\]><\/description>/) || block.match(/<description[^>]*>(.*?)<\/description>/))?.[1]?.replace(/<[^>]+>/g,'').trim() || '';
       const pubDate     = (block.match(/<pubDate[^>]*>(.*?)<\/pubDate>/))?.[1]?.trim() || '';
       const link        = (block.match(/<link[^>]*>(.*?)<\/link>/))?.[1]?.trim() || '';
-      if (title) items.push({ title, description: description.substring(0, 300), pubDate, link });
+      if (title) items.push({ title, description: description.substring(0, 400), pubDate, link });
     }
     return items;
-  } catch(e) {
-    return [];
-  }
+  } catch(e) { return []; }
 }
 
-function isHighImpact(title, description) {
+// Pre-filter before calling AI — saves API calls
+function passesPreFilter(title, description) {
   const text = (title + ' ' + description).toLowerCase();
-  return HIGH_IMPACT_KEYWORDS.some(kw => text.includes(kw));
+  if (DEFINITE_NOISE.some(n => text.includes(n))) return false;
+  return BROAD_RELEVANCE_KEYWORDS.some(kw => text.includes(kw));
+}
+
+// AI is the REAL judge — reads context, not just keywords
+async function aiJudge(title, description) {
+  const prompt = `You are an expert Indian stock market analyst and alert filter for NSE/BSE traders.
+
+A news item just came in. Your job is to judge whether this specific news will cause SIGNIFICANT and IMMEDIATE price movement in Indian markets (Nifty50, BankNifty, or specific heavy-weight stocks).
+
+CRITICAL EXAMPLES to calibrate your scoring:
+- "US and Israel attack Iran" → score 9 (oil shock, global risk-off, Nifty crash)
+- "Reliance ordered to stop buying Russian oil" → score 9 (Reliance is 10% of Nifty, oil costs spike)
+- "RBI cuts repo rate by 50bps in emergency meeting" → score 9 (massive bullish)
+- "Fed raises rates unexpectedly" → score 8 (global selloff, FII outflows from India)
+- "Adani Group fraud alleged by US DOJ" → score 8 (heavy-weight crash)
+- "Reliance Q4 profit up 8%, beats estimates" → score 4 (routine, already priced in)
+- "India GDP grows 7.2%" → score 5 (positive but routine quarterly data)
+- "SEBI bans 10 small entities for market manipulation" → score 3 (too small to move indices)
+- "Infosys gives weak guidance, cuts revenue forecast" → score 7 (IT sector selloff)
+- "Oil prices fall 8% on OPEC supply increase" → score 8 (massive impact on India import costs)
+- "PM Modi meets Trump" → score 3 (political, no direct market impact)
+
+NEWS TO JUDGE:
+HEADLINE: ${title}
+DETAILS: ${description}
+
+Think about:
+1. Does this affect India specifically or heavy-weight Indian stocks?
+2. Is this SURPRISING vs already expected/known?
+3. Scale of impact — does it move indices or just one small stock?
+4. Is this actionable TODAY for a trader?
+
+Reply ONLY with valid JSON, no explanation outside JSON:
+{"score": 7, "impact": "bearish", "reason": "one sentence why this moves markets", "sectors": "Oil & Gas, Aviation, FMCG", "action": "Sell Nifty / Buy crude / Wait for open", "headline_summary": "10 word plain summary"}
+
+impact must be exactly one of: "bullish", "bearish", "neutral"
+score is 1-10`;
+
+  try {
+    const response = await askAI(prompt);
+    if (!response) return null;
+    // Extract JSON even if AI adds extra text
+    const jsonMatch = response.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const json = JSON.parse(jsonMatch[0]);
+    if (typeof json.score !== 'number') return null;
+    return json;
+  } catch(e) {
+    console.warn('[Alert] AI judge parse failed:', e.message);
+    return null;
+  }
 }
 
 async function sendTelegramAlert(chatIds, message) {
@@ -704,12 +765,12 @@ async function sendTelegramAlert(chatIds, message) {
   }
 }
 
-// In-memory store of user chat IDs (populated via /api/alert-subscribe)
+// In-memory subscriber store
 const alertSubscribers = new Set(
   (process.env.TG_CHAT_IDS || process.env.TG_CHAT_ID || '').split(',').map(x=>x.trim()).filter(Boolean)
 );
 
-// POST /api/alert-subscribe — frontend calls this when user connects Telegram
+// POST /api/alert-subscribe
 app.post('/api/alert-subscribe', (req, res) => {
   const { chat_id } = req.body;
   if (!chat_id) return res.status(400).json({ error: 'chat_id required' });
@@ -718,13 +779,17 @@ app.post('/api/alert-subscribe', (req, res) => {
   res.json({ ok: true, subscribers: alertSubscribers.size });
 });
 
-// GET /api/alert-subscribers — admin view
+// GET /api/alert-subscribers
 app.get('/api/alert-subscribers', (req, res) => {
   res.json({ count: alertSubscribers.size, ids: [...alertSubscribers] });
 });
 
-// Main alert polling loop — runs every 3 minutes
-async function runAlertEngine() {
+// GET /api/alert-status — debug
+app.get('/api/alert-status', (req, res) => {
+  res.json({ subscribers: alertSubscribers.size, sentAlertsCount: sentAlerts.size, engineStarted, feeds: RSS_FEEDS.length });
+});
+
+async function runAlertEngine(isStartup = false) {
   if (!alertSubscribers.size) return;
 
   const allItems = [];
@@ -733,72 +798,93 @@ async function runAlertEngine() {
     allItems.push(...items);
   }
 
-  // Filter new high-impact items
-  const newItems = allItems.filter(item => {
+  // Startup: silently mark all current items as seen — no alerts on restart
+  if (isStartup) {
+    allItems.forEach(item => sentAlerts.add(hashStr(item.title)));
+    console.log(`[Alerts] Startup — ${allItems.length} existing items marked seen. Now watching for NEW news.`);
+    return;
+  }
+
+  // Step 1: age + dedup filter
+  const fresh = allItems.filter(item => {
     const h = hashStr(item.title);
     if (sentAlerts.has(h)) return false;
-    if (!isHighImpact(item.title, item.description)) return false;
-    // Check if published in last 10 minutes
     if (item.pubDate) {
       const age = Date.now() - new Date(item.pubDate).getTime();
-      if (age > 10 * 60 * 1000) return false;
+      if (age > 8 * 60 * 1000) { sentAlerts.add(h); return false; } // skip >8 min old
     }
     return true;
   });
 
-  for (const item of newItems.slice(0, 3)) { // max 3 alerts per cycle
-    const h = hashStr(item.title);
-    sentAlerts.add(h);
+  if (!fresh.length) return;
 
-    // Ask AI to analyze impact on Indian markets
-    const prompt = `You are a senior Indian stock market analyst. A breaking news just came in:
+  // Step 2: cheap pre-filter (no API call)
+  const candidates = fresh.filter(item => {
+    if (!passesPreFilter(item.title, item.description)) {
+      sentAlerts.add(hashStr(item.title));
+      return false;
+    }
+    return true;
+  });
 
-HEADLINE: ${item.title}
-DETAILS: ${item.description}
+  if (!candidates.length) return;
+  console.log(`[Alerts] ${candidates.length} candidate(s) → sending to AI judge...`);
 
-In 3 lines max, tell Indian traders:
-1. Market impact (Bullish/Bearish/Neutral for Nifty)
-2. Which sectors/stocks are affected
-3. Suggested action (buy/sell/wait with specific instrument if possible)
+  // Step 3: AI is the real gate
+  for (const item of candidates.slice(0, 5)) {
+    sentAlerts.add(hashStr(item.title));
 
-Be direct, specific, no fluff. Format for Telegram.`;
+    const ai = await aiJudge(item.title, item.description);
 
-    const analysis = await askAI(prompt);
+    if (!ai) {
+      console.log(`[Alerts] AI failed for: ${item.title}`);
+      continue;
+    }
 
-    const msg = `🚨 <b>BREAKING MARKET ALERT</b>
+    console.log(`[Alerts] Score ${ai.score}/10 (${ai.impact}): ${item.title}`);
+
+    if (ai.score < 7) continue; // below threshold — skip silently
+
+    // Format and send
+    const emoji = ai.impact === 'bearish' ? '🔴' : ai.impact === 'bullish' ? '🟢' : '🟡';
+    const urgency = ai.score >= 9 ? '🚨 BREAKING' : ai.score >= 8 ? '⚠️ ALERT' : '📊 UPDATE';
+    const scoreBar = '█'.repeat(ai.score - 5) + '░'.repeat(10 - ai.score);
+
+    const msg =
+`${emoji} <b>${urgency} — ${ai.impact.toUpperCase()}</b>
 
 📰 <b>${item.title}</b>
 
-${analysis ? `🤖 <b>AI Analysis:</b>\n${analysis}` : ''}
+📊 Impact: ${ai.score}/10  ${scoreBar}
+💡 ${ai.reason}
+🏭 Sectors: ${ai.sectors}
+⚡ Action: <b>${ai.action}</b>
 
 🕐 ${new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })} IST
-<a href="${item.link}">Read more</a>`;
+<a href="${item.link}">Read full story →</a>`;
 
     await sendTelegramAlert([...alertSubscribers], msg);
-    console.log(`[Alerts] Sent: ${item.title}`);
-    await new Promise(r => setTimeout(r, 2000)); // 2s between messages
+    console.log(`[Alerts] ✅ SENT (${ai.score}/10): ${item.title}`);
+    await new Promise(r => setTimeout(r, 2000));
   }
 
-  // Clean old hashes (keep last 500)
-  if (sentAlerts.size > 500) {
+  if (sentAlerts.size > 1000) {
     const arr = [...sentAlerts];
-    arr.slice(0, arr.length - 500).forEach(h => sentAlerts.delete(h));
+    arr.slice(0, 500).forEach(h => sentAlerts.delete(h));
   }
 }
 
-// Market hours alert (extra-frequent during market hours IST 9am-3:30pm)
 function startAlertEngine() {
-  console.log('[Alerts] Engine started — polling RSS every 3 minutes');
-  runAlertEngine(); // run immediately on start
-  setInterval(() => {
-    const now = new Date();
-    const istHour = (now.getUTCHours() + 5) % 24;
-    const istMin  = (now.getUTCMinutes() + 30) % 60;
-    const istTime = istHour + istMin / 60;
-    // Run every 3 min during market hours, every 10 min otherwise
-    runAlertEngine();
-  }, 3 * 60 * 1000);
+  if (engineStarted) return;
+  engineStarted = true;
+  console.log('[Alerts] Engine starting...');
+  runAlertEngine(true).then(() => {
+    console.log('[Alerts] Watching for breaking news every 3 minutes.');
+    setInterval(() => runAlertEngine(false), 3 * 60 * 1000);
+  });
 }
+
+
 
 
 // ── RSS News Endpoint — free, no API key ───────────────────────────────────────

@@ -573,17 +573,262 @@ app.post('/api/groq', async (req, res) => {
   } catch(e) { res.status(502).json({ error: 'Groq proxy failed', detail: e.message }); }
 });
 
-// ── NewsAPI Proxy ──────────────────────────────────────────────────────────────
-app.get('/api/news', async (req, res) => {
-  const { q, apiKey, pageSize = 10 } = req.query;
-  if (!apiKey) return res.status(401).json({ error: 'NewsAPI key required' });
+// ── Gemini Flash AI Proxy ──────────────────────────────────────────────────────
+app.post('/api/gemini', async (req, res) => {
+  const GEMINI_KEY = process.env.GEMINI_API_KEY;
+  if (!GEMINI_KEY) return res.status(503).json({ error: 'GEMINI_API_KEY not set' });
   try {
-    const r = await fetch(`https://newsapi.org/v2/everything?q=${encodeURIComponent(q)}&language=en&sortBy=publishedAt&pageSize=${pageSize}&apiKey=${apiKey}`, { timeout: 10000 });
-    res.json(await r.json());
-  } catch(e) { res.status(502).json({ error: 'NewsAPI failed', detail: e.message }); }
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`, {
+      method : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body   : JSON.stringify({ contents: [{ parts: [{ text: req.body.prompt }] }] }),
+      timeout: 20000,
+    });
+    const data = await r.json();
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    res.json({ text });
+  } catch(e) { res.status(502).json({ error: 'Gemini failed', detail: e.message }); }
 });
 
-// ── Telegram Proxy ─────────────────────────────────────────────────────────────
+// ── AI helper: Groq first, Gemini fallback ─────────────────────────────────────
+async function askAI(prompt, groqModel = 'llama3-8b-8192') {
+  // Try Groq first
+  const GROQ_KEY = process.env.GROQ_API_KEY;
+  if (GROQ_KEY) {
+    try {
+      const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method : 'POST',
+        headers: { 'Content-Type':'application/json', 'Authorization':`Bearer ${GROQ_KEY}` },
+        body   : JSON.stringify({ model: groqModel, messages: [{ role:'user', content: prompt }], max_tokens: 400 }),
+        timeout: 15000,
+      });
+      if (r.ok) {
+        const d = await r.json();
+        const text = d?.choices?.[0]?.message?.content || '';
+        if (text) return text;
+      }
+    } catch(e) { console.warn('[AI] Groq failed, trying Gemini:', e.message); }
+  }
+  // Fallback to Gemini Flash
+  const GEMINI_KEY = process.env.GEMINI_API_KEY;
+  if (GEMINI_KEY) {
+    try {
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`, {
+        method : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body   : JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+        timeout: 20000,
+      });
+      const data = await r.json();
+      return data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    } catch(e) { console.warn('[AI] Gemini also failed:', e.message); }
+  }
+  return null;
+}
+
+// ── ALERT ENGINE — RSS-based, no API key needed ────────────────────────────────
+const RSS_FEEDS = [
+  'https://feeds.feedburner.com/ndtvnews-top-stories',
+  'https://timesofindia.indiatimes.com/rssfeedstopstories.cms',
+  'https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms',
+  'https://www.moneycontrol.com/rss/MCtopnews.xml',
+  'https://feeds.reuters.com/reuters/INtopNews',
+  'https://feeds.reuters.com/reuters/businessNews',
+];
+
+// Keywords that matter for Indian markets
+const HIGH_IMPACT_KEYWORDS = [
+  // Geopolitical
+  'war','attack','strike','bomb','missile','invasion','conflict','sanction','iran','russia','china','pakistan','nato',
+  // Market moving
+  'rbi','rate cut','rate hike','repo rate','inflation','gdp','recession','fed reserve','powell','imf',
+  // Indian markets
+  'sebi','nse','bse','nifty','sensex','circuit','halt','ban','default','bankruptcy','scam','fraud',
+  // Commodities
+  'crude oil','oil price','gold price','rupee','dollar','forex',
+  // Corporate
+  'reliance','adani','tata','hdfc','infosys','wipro','ongc','earnings','quarterly results',
+];
+
+const sentAlerts = new Set(); // deduplicate — store headline hashes
+let alertsEnabled = true;
+
+function hashStr(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
+  return Math.abs(h).toString(36);
+}
+
+async function fetchRSSFeed(url) {
+  try {
+    const r = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; DeltaBuddy/1.0)' },
+      timeout: 8000,
+    });
+    if (!r.ok) return [];
+    const xml = await r.text();
+    // Parse items from RSS XML
+    const items = [];
+    const itemRegex = /<item>([\s\S]*?)<\/item>/g;
+    let match;
+    while ((match = itemRegex.exec(xml)) !== null) {
+      const block = match[1];
+      const title       = (block.match(/<title[^>]*><!\[CDATA\[(.*?)\]\]><\/title>/) || block.match(/<title[^>]*>(.*?)<\/title>/))?.[1]?.trim() || '';
+      const description = (block.match(/<description[^>]*><!\[CDATA\[(.*?)\]\]><\/description>/) || block.match(/<description[^>]*>(.*?)<\/description>/))?.[1]?.replace(/<[^>]+>/g,'').trim() || '';
+      const pubDate     = (block.match(/<pubDate[^>]*>(.*?)<\/pubDate>/))?.[1]?.trim() || '';
+      const link        = (block.match(/<link[^>]*>(.*?)<\/link>/))?.[1]?.trim() || '';
+      if (title) items.push({ title, description: description.substring(0, 300), pubDate, link });
+    }
+    return items;
+  } catch(e) {
+    return [];
+  }
+}
+
+function isHighImpact(title, description) {
+  const text = (title + ' ' + description).toLowerCase();
+  return HIGH_IMPACT_KEYWORDS.some(kw => text.includes(kw));
+}
+
+async function sendTelegramAlert(chatIds, message) {
+  const BOT_TOKEN = process.env.TG_BOT_TOKEN;
+  if (!BOT_TOKEN || !chatIds?.length) return;
+  for (const chatId of chatIds) {
+    try {
+      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        method : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body   : JSON.stringify({ chat_id: chatId, text: message, parse_mode: 'HTML', disable_web_page_preview: true }),
+      });
+    } catch(e) { console.warn('[TG] Send failed:', e.message); }
+  }
+}
+
+// In-memory store of user chat IDs (populated via /api/alert-subscribe)
+const alertSubscribers = new Set(
+  (process.env.TG_CHAT_IDS || process.env.TG_CHAT_ID || '').split(',').map(x=>x.trim()).filter(Boolean)
+);
+
+// POST /api/alert-subscribe — frontend calls this when user connects Telegram
+app.post('/api/alert-subscribe', (req, res) => {
+  const { chat_id } = req.body;
+  if (!chat_id) return res.status(400).json({ error: 'chat_id required' });
+  alertSubscribers.add(String(chat_id));
+  console.log(`[Alerts] Subscriber added: ${chat_id} — total: ${alertSubscribers.size}`);
+  res.json({ ok: true, subscribers: alertSubscribers.size });
+});
+
+// GET /api/alert-subscribers — admin view
+app.get('/api/alert-subscribers', (req, res) => {
+  res.json({ count: alertSubscribers.size, ids: [...alertSubscribers] });
+});
+
+// Main alert polling loop — runs every 3 minutes
+async function runAlertEngine() {
+  if (!alertSubscribers.size) return;
+
+  const allItems = [];
+  for (const feed of RSS_FEEDS) {
+    const items = await fetchRSSFeed(feed);
+    allItems.push(...items);
+  }
+
+  // Filter new high-impact items
+  const newItems = allItems.filter(item => {
+    const h = hashStr(item.title);
+    if (sentAlerts.has(h)) return false;
+    if (!isHighImpact(item.title, item.description)) return false;
+    // Check if published in last 10 minutes
+    if (item.pubDate) {
+      const age = Date.now() - new Date(item.pubDate).getTime();
+      if (age > 10 * 60 * 1000) return false;
+    }
+    return true;
+  });
+
+  for (const item of newItems.slice(0, 3)) { // max 3 alerts per cycle
+    const h = hashStr(item.title);
+    sentAlerts.add(h);
+
+    // Ask AI to analyze impact on Indian markets
+    const prompt = `You are a senior Indian stock market analyst. A breaking news just came in:
+
+HEADLINE: ${item.title}
+DETAILS: ${item.description}
+
+In 3 lines max, tell Indian traders:
+1. Market impact (Bullish/Bearish/Neutral for Nifty)
+2. Which sectors/stocks are affected
+3. Suggested action (buy/sell/wait with specific instrument if possible)
+
+Be direct, specific, no fluff. Format for Telegram.`;
+
+    const analysis = await askAI(prompt);
+
+    const msg = `🚨 <b>BREAKING MARKET ALERT</b>
+
+📰 <b>${item.title}</b>
+
+${analysis ? `🤖 <b>AI Analysis:</b>\n${analysis}` : ''}
+
+🕐 ${new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })} IST
+<a href="${item.link}">Read more</a>`;
+
+    await sendTelegramAlert([...alertSubscribers], msg);
+    console.log(`[Alerts] Sent: ${item.title}`);
+    await new Promise(r => setTimeout(r, 2000)); // 2s between messages
+  }
+
+  // Clean old hashes (keep last 500)
+  if (sentAlerts.size > 500) {
+    const arr = [...sentAlerts];
+    arr.slice(0, arr.length - 500).forEach(h => sentAlerts.delete(h));
+  }
+}
+
+// Market hours alert (extra-frequent during market hours IST 9am-3:30pm)
+function startAlertEngine() {
+  console.log('[Alerts] Engine started — polling RSS every 3 minutes');
+  runAlertEngine(); // run immediately on start
+  setInterval(() => {
+    const now = new Date();
+    const istHour = (now.getUTCHours() + 5) % 24;
+    const istMin  = (now.getUTCMinutes() + 30) % 60;
+    const istTime = istHour + istMin / 60;
+    // Run every 3 min during market hours, every 10 min otherwise
+    runAlertEngine();
+  }, 3 * 60 * 1000);
+}
+
+
+// ── RSS News Endpoint — free, no API key ───────────────────────────────────────
+app.get('/api/rss-news', async (req, res) => {
+  try {
+    const allItems = [];
+    for (const feed of RSS_FEEDS.slice(0, 4)) { // use first 4 feeds
+      const items = await fetchRSSFeed(feed);
+      allItems.push(...items);
+    }
+    // Deduplicate by title, sort by date, take top 20
+    const seen = new Set();
+    const articles = allItems
+      .filter(item => { if (seen.has(item.title)) return false; seen.add(item.title); return true; })
+      .sort((a, b) => new Date(b.pubDate) - new Date(a.pubDate))
+      .slice(0, 20)
+      .map(item => ({
+        url        : item.link,
+        title      : item.title,
+        description: item.description,
+        source     : new URL(item.link || 'https://example.com').hostname.replace('www.',''),
+        publishedAt: item.pubDate || new Date().toISOString(),
+      }));
+    res.json({ articles });
+  } catch(e) {
+    res.status(502).json({ articles: [], error: e.message });
+  }
+});
+
+
 app.post('/api/telegram', async (req, res) => {
   const BOT_TOKEN = process.env.TG_BOT_TOKEN;
   if (!BOT_TOKEN) return res.status(503).json({ error: 'TG_BOT_TOKEN not set' });
@@ -638,6 +883,7 @@ app.listen(PORT, () => {
   console.log(`📈 Live Ticks:      http://localhost:${PORT}/api/angel/ticks`);
   console.log(`❤️  Health:         http://localhost:${PORT}/api/health\n`);
   getNSECookies();
+  startAlertEngine();
 
   // ── Keep-alive ping so Render free tier never sleeps ──────────────────
   const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;

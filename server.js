@@ -765,10 +765,14 @@ async function sendTelegramAlert(chatIds, message) {
   }
 }
 
-// In-memory subscriber store
+// In-memory subscriber store — seeded from env var on startup
+// TG_CHAT_IDS = comma-separated list e.g. "123456789,987654321"
 const alertSubscribers = new Set(
-  (process.env.TG_CHAT_IDS || process.env.TG_CHAT_ID || '').split(',').map(x=>x.trim()).filter(Boolean)
+  (process.env.TG_CHAT_IDS || process.env.TG_CHAT_ID || '')
+    .split(',').map(x => x.trim()).filter(Boolean)
 );
+
+console.log(`[Alerts] Loaded ${alertSubscribers.size} subscriber(s) from env vars.`);
 
 // POST /api/alert-subscribe
 app.post('/api/alert-subscribe', (req, res) => {
@@ -786,7 +790,42 @@ app.get('/api/alert-subscribers', (req, res) => {
 
 // GET /api/alert-status — debug
 app.get('/api/alert-status', (req, res) => {
-  res.json({ subscribers: alertSubscribers.size, sentAlertsCount: sentAlerts.size, engineStarted, feeds: RSS_FEEDS.length });
+  res.json({
+    subscribers     : alertSubscribers.size,
+    subscriberIds   : [...alertSubscribers],
+    sentAlertsCount : sentAlerts.size,
+    engineStarted,
+    feeds           : RSS_FEEDS.length,
+    groqKeySet      : !!process.env.GROQ_API_KEY,
+    geminiKeySet    : !!process.env.GEMINI_API_KEY,
+    tgBotSet        : !!process.env.TG_BOT_TOKEN,
+    tgChatIdEnv     : process.env.TG_CHAT_ID || process.env.TG_CHAT_IDS || 'NOT SET',
+  });
+});
+
+// GET /api/alert-test — manually fire a test alert to all subscribers
+app.get('/api/alert-test', async (req, res) => {
+  if (!alertSubscribers.size) {
+    return res.json({ ok: false, error: 'No subscribers. Add TG_CHAT_ID to Render env vars or subscribe via frontend.' });
+  }
+  const msg = `✅ <b>DeltaBuddy Alert Engine — TEST</b>
+
+🔔 Alert system is working correctly.
+👥 Subscribers: ${alertSubscribers.size}
+📡 Feeds: ${RSS_FEEDS.length}
+🕐 ${new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })} IST
+
+You will receive alerts when high-impact market news breaks.`;
+
+  await sendTelegramAlert([...alertSubscribers], msg);
+  res.json({ ok: true, sent_to: [...alertSubscribers] });
+});
+
+// GET /api/alert-run — manually trigger one scan cycle (for debugging)
+app.get('/api/alert-run', async (req, res) => {
+  const before = sentAlerts.size;
+  await runAlertEngine(false);
+  res.json({ ok: true, subscribers: alertSubscribers.size, seenBefore: before, seenAfter: sentAlerts.size });
 });
 
 async function runAlertEngine(isStartup = false) {
@@ -800,19 +839,19 @@ async function runAlertEngine(isStartup = false) {
 
   // Startup: silently mark all current items as seen — no alerts on restart
   if (isStartup) {
-    allItems.forEach(item => sentAlerts.add(hashStr(item.title)));
-    console.log(`[Alerts] Startup — ${allItems.length} existing items marked seen. Now watching for NEW news.`);
+    let wouldAlert = 0;
+    for (const item of allItems) {
+      sentAlerts.add(hashStr(item.title));
+      if (passesPreFilter(item.title, item.description)) wouldAlert++;
+    }
+    console.log(`[Alerts] Startup — ${allItems.length} items marked seen (${wouldAlert} passed pre-filter). Watching for NEW news.`);
     return;
   }
 
-  // Step 1: age + dedup filter
+  // Step 1: dedup only — don't filter by age (RSS feeds cache articles 15-30 mins)
   const fresh = allItems.filter(item => {
     const h = hashStr(item.title);
     if (sentAlerts.has(h)) return false;
-    if (item.pubDate) {
-      const age = Date.now() - new Date(item.pubDate).getTime();
-      if (age > 8 * 60 * 1000) { sentAlerts.add(h); return false; } // skip >8 min old
-    }
     return true;
   });
 
@@ -843,7 +882,7 @@ async function runAlertEngine(isStartup = false) {
 
     console.log(`[Alerts] Score ${ai.score}/10 (${ai.impact}): ${item.title}`);
 
-    if (ai.score < 7) continue; // below threshold — skip silently
+    if (ai.score < 6) continue; // below threshold — skip silently
 
     // Format and send
     const emoji = ai.impact === 'bearish' ? '🔴' : ai.impact === 'bullish' ? '🟢' : '🟡';

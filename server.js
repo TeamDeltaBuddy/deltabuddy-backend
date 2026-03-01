@@ -592,39 +592,64 @@ app.post('/api/gemini', async (req, res) => {
 
 // ── AI helper: Groq first, Gemini fallback ─────────────────────────────────────
 async function askAI(prompt, groqModel = 'llama3-8b-8192') {
+  const GROQ_KEY   = process.env.GROQ_API_KEY;
+  const GEMINI_KEY = process.env.GEMINI_API_KEY;
+
   // Try Groq first
-  const GROQ_KEY = process.env.GROQ_API_KEY;
   if (GROQ_KEY) {
     try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 12000);
       const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method : 'POST',
         headers: { 'Content-Type':'application/json', 'Authorization':`Bearer ${GROQ_KEY}` },
-        body   : JSON.stringify({ model: groqModel, messages: [{ role:'user', content: prompt }], max_tokens: 400 }),
-        timeout: 15000,
+        body   : JSON.stringify({ model: groqModel, messages: [{ role:'user', content: prompt }], max_tokens: 300, temperature: 0.1 }),
+        signal : controller.signal,
       });
+      clearTimeout(timer);
       if (r.ok) {
         const d = await r.json();
         const text = d?.choices?.[0]?.message?.content || '';
-        if (text) return text;
+        if (text) { console.log('[AI] Groq responded ok'); return text; }
+        console.warn('[AI] Groq empty response:', JSON.stringify(d).substring(0,200));
+      } else {
+        const err = await r.text();
+        console.warn(`[AI] Groq HTTP ${r.status}:`, err.substring(0,200));
       }
-    } catch(e) { console.warn('[AI] Groq failed, trying Gemini:', e.message); }
+    } catch(e) { console.warn('[AI] Groq exception:', e.message); }
+  } else {
+    console.warn('[AI] GROQ_API_KEY not set');
   }
+
   // Fallback to Gemini Flash
-  const GEMINI_KEY = process.env.GEMINI_API_KEY;
   if (GEMINI_KEY) {
     try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15000);
       const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`, {
         method : 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body   : JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-        timeout: 20000,
+        body   : JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.1, maxOutputTokens: 300 } }),
+        signal : controller.signal,
       });
-      const data = await r.json();
-      return data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    } catch(e) { console.warn('[AI] Gemini also failed:', e.message); }
+      clearTimeout(timer);
+      if (r.ok) {
+        const data = await r.json();
+        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        if (text) { console.log('[AI] Gemini responded ok'); return text; }
+        console.warn('[AI] Gemini empty:', JSON.stringify(data).substring(0,200));
+      } else {
+        const err = await r.text();
+        console.warn(`[AI] Gemini HTTP ${r.status}:`, err.substring(0,200));
+      }
+    } catch(e) { console.warn('[AI] Gemini exception:', e.message); }
+  } else {
+    console.warn('[AI] GEMINI_API_KEY not set');
   }
+
   return null;
 }
+
 
 // ── ALERT ENGINE — RSS-based, AI-first smart filtering ────────────────────────
 
@@ -703,50 +728,33 @@ function passesPreFilter(title, description) {
 
 // AI is the REAL judge — reads context, not just keywords
 async function aiJudge(title, description) {
-  const prompt = `You are an expert Indian stock market analyst and alert filter for NSE/BSE traders.
+  const prompt = `You are an Indian stock market alert filter for NSE/BSE traders.
 
-A news item just came in. Your job is to judge whether this specific news will cause SIGNIFICANT and IMMEDIATE price movement in Indian markets (Nifty50, BankNifty, or specific heavy-weight stocks).
-
-CRITICAL EXAMPLES to calibrate your scoring:
-- "US and Israel attack Iran" → score 9 (oil shock, global risk-off, Nifty crash)
-- "Reliance ordered to stop buying Russian oil" → score 9 (Reliance is 10% of Nifty, oil costs spike)
-- "RBI cuts repo rate by 50bps in emergency meeting" → score 9 (massive bullish)
-- "Fed raises rates unexpectedly" → score 8 (global selloff, FII outflows from India)
-- "Adani Group fraud alleged by US DOJ" → score 8 (heavy-weight crash)
-- "Reliance Q4 profit up 8%, beats estimates" → score 4 (routine, already priced in)
-- "India GDP grows 7.2%" → score 5 (positive but routine quarterly data)
-- "SEBI bans 10 small entities for market manipulation" → score 3 (too small to move indices)
-- "Infosys gives weak guidance, cuts revenue forecast" → score 7 (IT sector selloff)
-- "Oil prices fall 8% on OPEC supply increase" → score 8 (massive impact on India import costs)
-- "PM Modi meets Trump" → score 3 (political, no direct market impact)
-
-NEWS TO JUDGE:
+Rate this news for immediate market impact (1-10):
 HEADLINE: ${title}
-DETAILS: ${description}
+DETAILS: ${description.substring(0, 200)}
 
-Think about:
-1. Does this affect India specifically or heavy-weight Indian stocks?
-2. Is this SURPRISING vs already expected/known?
-3. Scale of impact — does it move indices or just one small stock?
-4. Is this actionable TODAY for a trader?
+Scoring guide:
+9-10: War/attack, central bank emergency, market circuit breaker, major fraud
+7-8: Rate decision surprise, oil shock >5%, heavy-weight stock major news (Reliance Russian oil ban = 9), sanctions
+5-6: Routine earnings beats/misses, regular economic data, political statements  
+1-4: Sports, lifestyle, minor corporate news
 
-Reply ONLY with valid JSON, no explanation outside JSON:
-{"score": 7, "impact": "bearish", "reason": "one sentence why this moves markets", "sectors": "Oil & Gas, Aviation, FMCG", "action": "Sell Nifty / Buy crude / Wait for open", "headline_summary": "10 word plain summary"}
+Reply ONLY in JSON (no other text):
+{"score":8,"impact":"bearish","reason":"one sentence","sectors":"Oil,Aviation","action":"Sell Nifty futures"}
 
-impact must be exactly one of: "bullish", "bearish", "neutral"
-score is 1-10`;
+impact must be: bullish, bearish, or neutral`;
 
   try {
     const response = await askAI(prompt);
     if (!response) return null;
-    // Extract JSON even if AI adds extra text
-    const jsonMatch = response.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return null;
+    const jsonMatch = response.match(/\{[\s\S]*?\}/);
+    if (!jsonMatch) { console.warn('[Alert] No JSON in AI response:', response.substring(0,100)); return null; }
     const json = JSON.parse(jsonMatch[0]);
     if (typeof json.score !== 'number') return null;
     return json;
   } catch(e) {
-    console.warn('[Alert] AI judge parse failed:', e.message);
+    console.warn('[Alert] aiJudge parse failed:', e.message);
     return null;
   }
 }
@@ -819,6 +827,24 @@ You will receive alerts when high-impact market news breaks.`;
 
   await sendTelegramAlert([...alertSubscribers], msg);
   res.json({ ok: true, sent_to: [...alertSubscribers] });
+});
+
+// GET /api/ai-test — verify AI keys are working
+app.get('/api/ai-test', async (req, res) => {
+  const result = await askAI('Reply with exactly this JSON: {"score":9,"impact":"bearish","reason":"test","sectors":"test","action":"test"}');
+  res.json({
+    ai_responded  : !!result,
+    response      : result?.substring(0, 300) || null,
+    groq_key_set  : !!process.env.GROQ_API_KEY,
+    gemini_key_set: !!process.env.GEMINI_API_KEY,
+  });
+});
+
+// GET /api/alert-run — manually trigger one scan cycle
+app.get('/api/alert-run', async (req, res) => {
+  const before = sentAlerts.size;
+  await runAlertEngine(false);
+  res.json({ ok: true, subscribers: alertSubscribers.size, seenBefore: before, seenAfter: sentAlerts.size });
 });
 
 // GET /api/alert-dryrun — scan latest RSS and show AI scores WITHOUT sending alerts

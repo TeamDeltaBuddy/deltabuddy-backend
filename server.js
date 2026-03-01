@@ -853,7 +853,6 @@ app.get('/api/ai-test', async (req, res) => {
   const GEMINI_KEY = process.env.GEMINI_API_KEY;
   const results    = { groq: null, gemini: null };
 
-  // Test Groq directly
   if (GROQ_KEY) {
     try {
       const r = await fetchWithTimeout(
@@ -861,20 +860,15 @@ app.get('/api/ai-test', async (req, res) => {
         {
           method : 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_KEY}` },
-          body   : JSON.stringify({ model: 'llama3-8b-8192', messages: [{ role: 'user', content: 'Say OK' }], max_tokens: 5 }),
+          body   : JSON.stringify({ model: 'llama-3.1-8b-instant', messages: [{ role: 'user', content: 'Say OK' }], max_tokens: 5 }),
         },
         10000
       );
       const body = await r.text();
       results.groq = { status: r.status, ok: r.ok, body: body.substring(0, 300) };
-    } catch(e) {
-      results.groq = { error: e.message };
-    }
-  } else {
-    results.groq = { error: 'GROQ_API_KEY not set' };
-  }
+    } catch(e) { results.groq = { error: e.message }; }
+  } else { results.groq = { error: 'GROQ_API_KEY not set' }; }
 
-  // Test Gemini directly
   if (GEMINI_KEY) {
     try {
       const r = await fetchWithTimeout(
@@ -888,14 +882,25 @@ app.get('/api/ai-test', async (req, res) => {
       );
       const body = await r.text();
       results.gemini = { status: r.status, ok: r.ok, body: body.substring(0, 300) };
-    } catch(e) {
-      results.gemini = { error: e.message };
-    }
-  } else {
-    results.gemini = { error: 'GEMINI_API_KEY not set' };
-  }
+    } catch(e) { results.gemini = { error: e.message }; }
+  } else { results.gemini = { error: 'GEMINI_API_KEY not set' }; }
 
   res.json(results);
+});
+
+// GET /api/alert-reset — clear seen items so current news gets re-evaluated
+app.get('/api/alert-reset', (req, res) => {
+  const before = sentAlerts.size;
+  sentAlerts.clear();
+  console.log(`[Alerts] Reset — cleared ${before} seen items`);
+  res.json({ ok: true, clearedItems: before, message: 'Seen list cleared. Next engine cycle will re-evaluate all current news.' });
+});
+
+// GET /api/alert-run — manually trigger one scan cycle
+app.get('/api/alert-run', async (req, res) => {
+  const before = sentAlerts.size;
+  await runAlertEngine(false);
+  res.json({ ok: true, subscribers: alertSubscribers.size, seenBefore: before, seenAfter: sentAlerts.size });
 });
 
 // GET /api/alert-run — manually trigger one scan cycle

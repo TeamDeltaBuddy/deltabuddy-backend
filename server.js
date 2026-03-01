@@ -591,6 +591,15 @@ app.post('/api/gemini', async (req, res) => {
 });
 
 // ── AI helper: Groq first, Gemini fallback ─────────────────────────────────────
+function fetchWithTimeout(url, options, ms = 12000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms);
+    fetch(url, options)
+      .then(r  => { clearTimeout(timer); resolve(r); })
+      .catch(e => { clearTimeout(timer); reject(e); });
+  });
+}
+
 async function askAI(prompt, groqModel = 'llama3-8b-8192') {
   const GROQ_KEY   = process.env.GROQ_API_KEY;
   const GEMINI_KEY = process.env.GEMINI_API_KEY;
@@ -598,57 +607,66 @@ async function askAI(prompt, groqModel = 'llama3-8b-8192') {
   // Try Groq first
   if (GROQ_KEY) {
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 12000);
-      const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method : 'POST',
-        headers: { 'Content-Type':'application/json', 'Authorization':`Bearer ${GROQ_KEY}` },
-        body   : JSON.stringify({ model: groqModel, messages: [{ role:'user', content: prompt }], max_tokens: 300, temperature: 0.1 }),
-        signal : controller.signal,
-      });
-      clearTimeout(timer);
+      const r = await fetchWithTimeout(
+        'https://api.groq.com/openai/v1/chat/completions',
+        {
+          method : 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_KEY}` },
+          body   : JSON.stringify({
+            model      : groqModel,
+            messages   : [{ role: 'user', content: prompt }],
+            max_tokens : 300,
+            temperature: 0.1,
+          }),
+        },
+        12000
+      );
       if (r.ok) {
-        const d = await r.json();
+        const d    = await r.json();
         const text = d?.choices?.[0]?.message?.content || '';
-        if (text) { console.log('[AI] Groq responded ok'); return text; }
-        console.warn('[AI] Groq empty response:', JSON.stringify(d).substring(0,200));
+        if (text) { console.log('[AI] Groq ok'); return text; }
+        console.warn('[AI] Groq empty:', JSON.stringify(d).substring(0, 200));
       } else {
         const err = await r.text();
-        console.warn(`[AI] Groq HTTP ${r.status}:`, err.substring(0,200));
+        console.warn(`[AI] Groq ${r.status}:`, err.substring(0, 200));
       }
-    } catch(e) { console.warn('[AI] Groq exception:', e.message); }
+    } catch(e) { console.warn('[AI] Groq error:', e.message); }
   } else {
-    console.warn('[AI] GROQ_API_KEY not set');
+    console.warn('[AI] GROQ_API_KEY missing');
   }
 
   // Fallback to Gemini Flash
   if (GEMINI_KEY) {
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 15000);
-      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`, {
-        method : 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body   : JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.1, maxOutputTokens: 300 } }),
-        signal : controller.signal,
-      });
-      clearTimeout(timer);
+      const r = await fetchWithTimeout(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`,
+        {
+          method : 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body   : JSON.stringify({
+            contents        : [{ parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0.1, maxOutputTokens: 300 },
+          }),
+        },
+        15000
+      );
       if (r.ok) {
         const data = await r.json();
         const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-        if (text) { console.log('[AI] Gemini responded ok'); return text; }
-        console.warn('[AI] Gemini empty:', JSON.stringify(data).substring(0,200));
+        if (text) { console.log('[AI] Gemini ok'); return text; }
+        console.warn('[AI] Gemini empty:', JSON.stringify(data).substring(0, 200));
       } else {
         const err = await r.text();
-        console.warn(`[AI] Gemini HTTP ${r.status}:`, err.substring(0,200));
+        console.warn(`[AI] Gemini ${r.status}:`, err.substring(0, 200));
       }
-    } catch(e) { console.warn('[AI] Gemini exception:', e.message); }
+    } catch(e) { console.warn('[AI] Gemini error:', e.message); }
   } else {
-    console.warn('[AI] GEMINI_API_KEY not set');
+    console.warn('[AI] GEMINI_API_KEY missing');
   }
 
   return null;
 }
+
 
 
 // ── ALERT ENGINE — RSS-based, AI-first smart filtering ────────────────────────
@@ -831,13 +849,53 @@ You will receive alerts when high-impact market news breaks.`;
 
 // GET /api/ai-test — verify AI keys are working
 app.get('/api/ai-test', async (req, res) => {
-  const result = await askAI('Reply with exactly this JSON: {"score":9,"impact":"bearish","reason":"test","sectors":"test","action":"test"}');
-  res.json({
-    ai_responded  : !!result,
-    response      : result?.substring(0, 300) || null,
-    groq_key_set  : !!process.env.GROQ_API_KEY,
-    gemini_key_set: !!process.env.GEMINI_API_KEY,
-  });
+  const GROQ_KEY   = process.env.GROQ_API_KEY;
+  const GEMINI_KEY = process.env.GEMINI_API_KEY;
+  const results    = { groq: null, gemini: null };
+
+  // Test Groq directly
+  if (GROQ_KEY) {
+    try {
+      const r = await fetchWithTimeout(
+        'https://api.groq.com/openai/v1/chat/completions',
+        {
+          method : 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_KEY}` },
+          body   : JSON.stringify({ model: 'llama3-8b-8192', messages: [{ role: 'user', content: 'Say OK' }], max_tokens: 5 }),
+        },
+        10000
+      );
+      const body = await r.text();
+      results.groq = { status: r.status, ok: r.ok, body: body.substring(0, 300) };
+    } catch(e) {
+      results.groq = { error: e.message };
+    }
+  } else {
+    results.groq = { error: 'GROQ_API_KEY not set' };
+  }
+
+  // Test Gemini directly
+  if (GEMINI_KEY) {
+    try {
+      const r = await fetchWithTimeout(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`,
+        {
+          method : 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body   : JSON.stringify({ contents: [{ parts: [{ text: 'Say OK' }] }] }),
+        },
+        12000
+      );
+      const body = await r.text();
+      results.gemini = { status: r.status, ok: r.ok, body: body.substring(0, 300) };
+    } catch(e) {
+      results.gemini = { error: e.message };
+    }
+  } else {
+    results.gemini = { error: 'GEMINI_API_KEY not set' };
+  }
+
+  res.json(results);
 });
 
 // GET /api/alert-run — manually trigger one scan cycle

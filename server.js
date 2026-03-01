@@ -821,11 +821,36 @@ You will receive alerts when high-impact market news breaks.`;
   res.json({ ok: true, sent_to: [...alertSubscribers] });
 });
 
-// GET /api/alert-run — manually trigger one scan cycle (for debugging)
-app.get('/api/alert-run', async (req, res) => {
-  const before = sentAlerts.size;
-  await runAlertEngine(false);
-  res.json({ ok: true, subscribers: alertSubscribers.size, seenBefore: before, seenAfter: sentAlerts.size });
+// GET /api/alert-dryrun — scan latest RSS and show AI scores WITHOUT sending alerts
+app.get('/api/alert-dryrun', async (req, res) => {
+  try {
+    const allItems = [];
+    for (const feed of RSS_FEEDS) {
+      const items = await fetchRSSFeed(feed);
+      allItems.push(...items);
+    }
+    // Take latest 10 that pass pre-filter, ignore dedup
+    const candidates = allItems
+      .filter(item => passesPreFilter(item.title, item.description))
+      .slice(0, 10);
+
+    const results = [];
+    for (const item of candidates) {
+      const ai = await aiJudge(item.title, item.description);
+      results.push({
+        title  : item.title,
+        score  : ai?.score ?? 'AI_FAILED',
+        impact : ai?.impact ?? '-',
+        reason : ai?.reason ?? '-',
+        action : ai?.action ?? '-',
+        wouldSend: ai?.score >= 6,
+      });
+      await new Promise(r => setTimeout(r, 500));
+    }
+    res.json({ total_fetched: allItems.length, candidates: candidates.length, results });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 async function runAlertEngine(isStartup = false) {

@@ -680,29 +680,45 @@ const RSS_FEEDS = [
   'https://feeds.reuters.com/reuters/businessNews',
 ];
 
-// First-pass filter — broad net to catch anything potentially relevant
-// This is NOT the final gate, just cuts obviously irrelevant noise before hitting AI
+// First-pass filter — only pass news that could plausibly move markets
 const BROAD_RELEVANCE_KEYWORDS = [
-  // Indian market names
-  'nifty','sensex','nse','bse','rbi','sebi','india','indian',
-  // Heavy weights & sectors
-  'reliance','adani','tata','hdfc','infosys','wipro','ongc','sbi','icici','kotak',
-  'oil','crude','gas','bank','pharma','it sector','auto','fmcg','metal','infra',
-  // Macro
-  'rate','inflation','gdp','rupee','dollar','fed','powell','imf','world bank',
-  // Geopolitical
-  'war','attack','sanction','iran','russia','china','pakistan','opec','nato',
-  'oil supply','pipeline','export ban','import ban','trade',
+  // Indian indices & regulators
+  'nifty','sensex','nse','bse','rbi','sebi',
+  // Global macro
+  'fed reserve','federal reserve','interest rate','repo rate','inflation','gdp',
+  'imf','world bank','opec','oil price','crude oil','crude price',
+  // Geopolitical at country/global level only
+  'war','airstrike','missile','nuclear','sanctions','trade war','tariff',
+  'iran','russia','ukraine','china','pakistan','nato','israel',
+  // Heavy-weight stocks — only major news
+  'reliance industries','adani group','adani enterprises','tata group',
+  'hdfc bank','icici bank','sbi bank','infosys','wipro',
   // Market events
-  'crash','circuit','halt','fraud','scam','default','bankruptcy','shutdown',
-  'earnings','result','profit','loss','revenue','guidance','outlook',
+  'market crash','circuit breaker','trading halt','stock market',
+  'fii','dii','foreign investor','rupee falls','rupee crashes',
+  'default','bankruptcy','fraud','scam','ponzi',
 ];
 
-// Hard skip — truly zero market relevance
+// Hard block — these topics can NEVER be market-moving regardless of keywords
 const DEFINITE_NOISE = [
-  'cricket','ipl','football','sports','film','bollywood','celebrity','wedding',
-  'recipe','travel','fashion','lifestyle','horoscope','weather forecast',
-  'covid vaccine','health tips','fitness','diet',
+  // Local accidents & crime
+  'car accident','road accident','overturns','speeding car','divider','pothole',
+  'bike accident','truck accident','train accident','plane crash investigation',
+  'murder','rape','assault','robbery','theft','arrested','police','fir filed',
+  'court hearing','bail','acquitted','sentenced',
+  // Local politics & government
+  'cm visits','pm visits','minister inaugurates','ribbon cutting','yojana',
+  'village','gram panchayat','municipal corporation','ward',
+  // Entertainment & lifestyle
+  'cricket','ipl','football','sports','film','bollywood','celebrity',
+  'wedding','divorce','actor','actress','singer','web series',
+  'recipe','travel','fashion','lifestyle','horoscope',
+  'temple','mosque','church','religious','festival celebration',
+  // Health (unless epidemic-scale)
+  'hospital','doctor','patient','surgery','disease','covid case',
+  'health tips','fitness','diet','yoga',
+  // Weather (unless catastrophic)
+  'rain','flood warning','weather forecast','temperature',
 ];
 
 const sentAlerts  = new Set();
@@ -746,20 +762,23 @@ function passesPreFilter(title, description) {
 
 // AI is the REAL judge — reads context, not just keywords
 async function aiJudge(title, description) {
-  const prompt = `You are an Indian stock market alert filter for NSE/BSE traders.
+  const prompt = `You are a strict Indian stock market alert filter. Your job is to BLOCK irrelevant news, not find creative ways to connect it to markets.
 
-Rate this news for immediate market impact (1-10):
+Rate this news 1-10 for DIRECT and IMMEDIATE impact on Nifty50/BankNifty/Sensex TODAY.
+
 HEADLINE: ${title}
 DETAILS: ${description.substring(0, 200)}
 
-Scoring guide:
-9-10: War/attack, central bank emergency, market circuit breaker, major fraud
-7-8: Rate decision surprise, oil shock >5%, heavy-weight stock major news (Reliance Russian oil ban = 9), sanctions
-5-6: Routine earnings beats/misses, regular economic data, political statements  
-1-4: Sports, lifestyle, minor corporate news
+SCORING RULES — read carefully:
+✅ Score 8-10 ONLY: War/airstrike, RBI/Fed emergency rate action, Nifty circuit breaker, Adani/Reliance crisis (like Russia oil ban), major bank collapse, oil price shock >5%
+✅ Score 6-7: Scheduled RBI/Fed rate decision surprise, major corporate fraud discovery, OPEC output cut, rupee crash >2%
+⚠️ Score 3-5: Routine earnings results, regular economic data, expected policy decisions
+❌ Score 1-2: Local accidents, crime, weather, sports, entertainment, local politics, hospital news, road accidents, state-level news, anything without direct financial impact
 
-Reply ONLY in JSON (no other text):
-{"score":8,"impact":"bearish","reason":"one sentence","sectors":"Oil,Aviation","action":"Sell Nifty futures"}
+CRITICAL: Do NOT invent indirect market connections. A car accident is NOT oil market news. A local murder is NOT a market event. A temple inauguration is NOT bullish. Score these 1-2 and move on.
+
+Reply ONLY in JSON:
+{"score":2,"impact":"neutral","reason":"local road accident, zero market relevance","sectors":"none","action":"ignore"}
 
 impact must be: bullish, bearish, or neutral`;
 
@@ -996,7 +1015,7 @@ async function runAlertEngine(isStartup = false) {
 
     console.log(`[Alerts] Score ${ai.score}/10 (${ai.impact}): ${item.title}`);
 
-    if (ai.score < 6) continue; // below threshold — skip silently
+    if (ai.score < 7) continue; // below threshold — skip silently
 
     // Format and send
     const emoji = ai.impact === 'bearish' ? '🔴' : ai.impact === 'bullish' ? '🟢' : '🟡';

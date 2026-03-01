@@ -578,7 +578,7 @@ app.post('/api/gemini', async (req, res) => {
   const GEMINI_KEY = process.env.GEMINI_API_KEY;
   if (!GEMINI_KEY) return res.status(503).json({ error: 'GEMINI_API_KEY not set' });
   try {
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`, {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`, {
       method : 'POST',
       headers: { 'Content-Type': 'application/json' },
       body   : JSON.stringify({ contents: [{ parts: [{ text: req.body.prompt }] }] }),
@@ -600,7 +600,7 @@ function fetchWithTimeout(url, options, ms = 12000) {
   });
 }
 
-async function askAI(prompt, groqModel = 'llama3-8b-8192') {
+async function askAI(prompt, groqModel = 'llama-3.1-8b-instant') {
   const GROQ_KEY   = process.env.GROQ_API_KEY;
   const GEMINI_KEY = process.env.GEMINI_API_KEY;
 
@@ -639,7 +639,7 @@ async function askAI(prompt, groqModel = 'llama3-8b-8192') {
   if (GEMINI_KEY) {
     try {
       const r = await fetchWithTimeout(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
         {
           method : 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -878,7 +878,7 @@ app.get('/api/ai-test', async (req, res) => {
   if (GEMINI_KEY) {
     try {
       const r = await fetchWithTimeout(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
         {
           method : 'POST',
           headers: { 'Content-Type': 'application/json' },

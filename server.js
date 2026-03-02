@@ -426,8 +426,119 @@ app.post('/api/angel/search-token', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// EXISTING ENDPOINTS (unchanged)
+// ANGEL ONE — PORTFOLIO, ORDERS, GREEKS, EXPIRY TOOLS
 // ══════════════════════════════════════════════════════════════════════════════
+
+// Helper: make authenticated Angel One REST call
+async function angelREST(path, method='GET', body=null) {
+  if (!angelToken) throw new Error('Angel One not logged in');
+  const opts = {
+    method,
+    headers: {
+      'Content-Type' : 'application/json',
+      'Authorization': `Bearer ${angelToken}`,
+      'Accept'       : 'application/json',
+      'X-UserType'   : 'USER',
+      'X-SourceID'   : 'WEB',
+      'X-ClientLocalIP': '127.0.0.1',
+      'X-ClientPublicIP': '127.0.0.1',
+      'X-MACAddress' : '00:00:00:00:00:00',
+      'X-PrivateKey' : ANGEL_API_KEY,
+    },
+  };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(`https://apiconnect.angelone.in${path}`, opts);
+  return r.json();
+}
+
+// GET /api/angel/portfolio — live positions + holdings
+app.get('/api/angel/portfolio', async (req, res) => {
+  if (!angelToken) return res.status(503).json({ error: 'Angel One not logged in', connected: false });
+  try {
+    const [positions, holdings, funds] = await Promise.all([
+      angelREST('/rest/secure/angelbroking/order/v1/getPosition'),
+      angelREST('/rest/secure/angelbroking/portfolio/v1/getHolding'),
+      angelREST('/rest/secure/angelbroking/user/v1/getRMS'),
+    ]);
+    res.json({
+      positions: positions?.data || [],
+      holdings : holdings?.data || [],
+      funds    : funds?.data || {},
+      fetchedAt: new Date().toISOString(),
+    });
+  } catch(e) { res.status(502).json({ error: e.message }); }
+});
+
+// GET /api/angel/orders — order book
+app.get('/api/angel/orders', async (req, res) => {
+  if (!angelToken) return res.status(503).json({ error: 'Angel One not logged in', connected: false });
+  try {
+    const data = await angelREST('/rest/secure/angelbroking/order/v1/getOrderBook');
+    res.json({ orders: data?.data || [], fetchedAt: new Date().toISOString() });
+  } catch(e) { res.status(502).json({ error: e.message }); }
+});
+
+// GET /api/angel/tradebook — completed trades today
+app.get('/api/angel/tradebook', async (req, res) => {
+  if (!angelToken) return res.status(503).json({ error: 'Angel One not logged in', connected: false });
+  try {
+    const data = await angelREST('/rest/secure/angelbroking/order/v1/getTradeBook');
+    res.json({ trades: data?.data || [], fetchedAt: new Date().toISOString() });
+  } catch(e) { res.status(502).json({ error: e.message }); }
+});
+
+// POST /api/angel/place-order — place a real order
+// Body: { variety, tradingsymbol, symboltoken, transactiontype, exchange, ordertype, producttype, duration, price, squareoff, stoploss, quantity }
+app.post('/api/angel/place-order', async (req, res) => {
+  if (!angelToken) return res.status(503).json({ error: 'Angel One not logged in' });
+  const required = ['variety','tradingsymbol','symboltoken','transactiontype','exchange','ordertype','producttype','duration','quantity'];
+  for (const f of required) {
+    if (!req.body[f]) return res.status(400).json({ error: `Missing field: ${f}` });
+  }
+  try {
+    const data = await angelREST('/rest/secure/angelbroking/order/v1/placeOrder', 'POST', {
+      variety        : req.body.variety,        // NORMAL | STOPLOSS | AMO | ROBO
+      tradingsymbol  : req.body.tradingsymbol,  // e.g. NIFTY23DEC19500CE
+      symboltoken    : req.body.symboltoken,    // e.g. 35001
+      transactiontype: req.body.transactiontype,// BUY | SELL
+      exchange       : req.body.exchange,       // NFO | NSE | BSE
+      ordertype      : req.body.ordertype,      // MARKET | LIMIT | SL | SL-M
+      producttype    : req.body.producttype,    // INTRADAY | CARRYFORWARD | DELIVERY
+      duration       : req.body.duration,       // DAY | IOC
+      price          : req.body.price || '0',
+      squareoff      : req.body.squareoff || '0',
+      stoploss       : req.body.stoploss || '0',
+      quantity       : req.body.quantity.toString(),
+    });
+    console.log('[Order]', req.body.transactiontype, req.body.tradingsymbol, 'x', req.body.quantity, '→', data?.status);
+    if (data?.status === false) return res.status(400).json({ error: data.message || 'Order rejected' });
+    res.json({ ok: true, orderId: data?.data?.orderid, message: data?.message, data });
+  } catch(e) { res.status(502).json({ error: e.message }); }
+});
+
+// POST /api/angel/cancel-order
+app.post('/api/angel/cancel-order', async (req, res) => {
+  if (!angelToken) return res.status(503).json({ error: 'Angel One not logged in' });
+  const { orderid, variety = 'NORMAL' } = req.body;
+  if (!orderid) return res.status(400).json({ error: 'orderid required' });
+  try {
+    const data = await angelREST('/rest/secure/angelbroking/order/v1/cancelOrder', 'POST', { variety, orderid });
+    res.json({ ok: data?.status !== false, data });
+  } catch(e) { res.status(502).json({ error: e.message }); }
+});
+
+// POST /api/angel/modify-order
+app.post('/api/angel/modify-order', async (req, res) => {
+  if (!angelToken) return res.status(503).json({ error: 'Angel One not logged in' });
+  try {
+    const data = await angelREST('/rest/secure/angelbroking/order/v1/modifyOrder', 'POST', req.body);
+    res.json({ ok: data?.status !== false, data });
+  } catch(e) { res.status(502).json({ error: e.message }); }
+});
+
+// ── MAX PAIN + EXPIRY TOOLS — defined after getNSECookies below ───────────────
+
+
 
 // ── NSE Cookie Management ─────────────────────────────────────────────────────
 let nseCookies = '', nseLastFetch = 0;
@@ -1122,7 +1233,202 @@ app.get('/api/nse/fno-ban', async (req, res) => {
   }
 });
 
-// ── Health ─────────────────────────────────────────────────────────────────────
+// ── RAZORPAY SUBSCRIPTION ─────────────────────────────────────────────────────
+const crypto = require('crypto');
+
+const RZP_KEY_ID     = process.env.RAZORPAY_KEY_ID;
+const RZP_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET;
+const RZP_PLAN_ID    = process.env.RAZORPAY_PLAN_ID; // set after creating plan once
+
+function rzpAuth() {
+  return 'Basic ' + Buffer.from(`${RZP_KEY_ID}:${RZP_KEY_SECRET}`).toString('base64');
+}
+
+// POST /api/rzp/create-plan — run ONCE to create the ₹299/quarter plan
+// Call this from browser after setting keys: POST /api/rzp/create-plan
+app.post('/api/rzp/create-plan', async (req, res) => {
+  if (!RZP_KEY_ID) return res.status(503).json({ error: 'Razorpay keys not set' });
+  try {
+    const r = await fetch('https://api.razorpay.com/v1/plans', {
+      method : 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': rzpAuth() },
+      body   : JSON.stringify({
+        period  : 'monthly',
+        interval: 3,           // every 3 months = quarterly
+        item    : {
+          name    : 'DeltaBuddy Pro',
+          amount  : 29900,     // ₹299 in paise
+          currency: 'INR',
+          description: 'DeltaBuddy Pro — Quarterly subscription',
+        },
+        notes: { plan_type: 'quarterly_299' },
+      }),
+    });
+    const data = await r.json();
+    res.json({ plan_id: data.id, data });
+  } catch(e) { res.status(502).json({ error: e.message }); }
+});
+
+// POST /api/rzp/create-subscription — called when user clicks Subscribe
+// Body: { userId, email, name }
+app.post('/api/rzp/create-subscription', async (req, res) => {
+  if (!RZP_KEY_ID || !RZP_PLAN_ID) return res.status(503).json({ error: 'Razorpay not configured' });
+  const { userId, email, name } = req.body;
+  if (!userId) return res.status(400).json({ error: 'userId required' });
+  try {
+    // Create/fetch Razorpay customer
+    const custR = await fetch('https://api.razorpay.com/v1/customers', {
+      method : 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': rzpAuth() },
+      body   : JSON.stringify({ name: name || email, email, notes: { firebase_uid: userId } }),
+    });
+    const cust = await custR.json();
+
+    // Create subscription with 3-month trial
+    const subR = await fetch('https://api.razorpay.com/v1/subscriptions', {
+      method : 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': rzpAuth() },
+      body   : JSON.stringify({
+        plan_id           : RZP_PLAN_ID,
+        customer_id       : cust.id,
+        quantity          : 1,
+        total_count       : 48,        // 4 years max
+        start_at          : Math.floor(Date.now() / 1000) + (90 * 24 * 3600), // starts after 3 months
+        customer_notify   : 1,
+        notes             : { firebase_uid: userId, email },
+      }),
+    });
+    const sub = await subR.json();
+    if (sub.error) return res.status(400).json({ error: sub.error.description });
+    res.json({ subscription_id: sub.id, short_url: sub.short_url, status: sub.status });
+  } catch(e) { res.status(502).json({ error: e.message }); }
+});
+
+// POST /api/rzp/verify-payment — called after Razorpay checkout success
+// Body: { razorpay_payment_id, razorpay_subscription_id, razorpay_signature, userId }
+app.post('/api/rzp/verify-payment', async (req, res) => {
+  const { razorpay_payment_id, razorpay_subscription_id, razorpay_signature, userId } = req.body;
+  if (!razorpay_payment_id || !razorpay_subscription_id || !razorpay_signature) {
+    return res.status(400).json({ error: 'Missing payment fields' });
+  }
+  try {
+    // Verify signature
+    const body = razorpay_payment_id + '|' + razorpay_subscription_id;
+    const expected = crypto.createHmac('sha256', RZP_KEY_SECRET).update(body).digest('hex');
+    if (expected !== razorpay_signature) {
+      return res.status(400).json({ error: 'Invalid signature — payment tampered' });
+    }
+    res.json({ ok: true, verified: true, subscription_id: razorpay_subscription_id });
+  } catch(e) { res.status(502).json({ error: e.message }); }
+});
+
+// POST /api/rzp/webhook — Razorpay sends events here (subscription activated, payment failed etc)
+// Set this URL in Razorpay Dashboard → Webhooks
+app.post('/api/rzp/webhook', express.raw({ type: 'application/json' }), (req, res) => {
+  const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+  if (webhookSecret) {
+    const sig      = req.headers['x-razorpay-signature'];
+    const expected = crypto.createHmac('sha256', webhookSecret).update(req.body).digest('hex');
+    if (sig !== expected) return res.status(400).json({ error: 'Invalid webhook signature' });
+  }
+  const event = JSON.parse(req.body);
+  console.log('[RZP Webhook]', event.event, JSON.stringify(event).substring(0, 200));
+  // Frontend handles status via Firebase — webhook just logs for now
+  res.json({ ok: true });
+});
+
+// GET /api/rzp/subscription/:subId — check subscription status
+app.get('/api/rzp/subscription/:subId', async (req, res) => {
+  if (!RZP_KEY_ID) return res.status(503).json({ error: 'Razorpay not configured' });
+  try {
+    const r = await fetch(`https://api.razorpay.com/v1/subscriptions/${req.params.subId}`, {
+      headers: { 'Authorization': rzpAuth() },
+    });
+    const data = await r.json();
+    res.json({ status: data.status, current_end: data.current_end, paid_count: data.paid_count });
+  } catch(e) { res.status(502).json({ error: e.message }); }
+});
+
+// GET /api/expiry-tools?symbol=NIFTY — max pain, PCR, key strikes, expected move
+app.get('/api/expiry-tools', async (req, res) => {
+  const symbol = (req.query.symbol || 'NIFTY').toUpperCase();
+  try {
+    const cookies = await getNSECookies();
+    const isIndex = ['NIFTY','BANKNIFTY','FINNIFTY','MIDCPNIFTY'].includes(symbol);
+    const apiUrl  = isIndex
+      ? `https://www.nseindia.com/api/option-chain-indices?symbol=${symbol}`
+      : `https://www.nseindia.com/api/option-chain-equities?symbol=${symbol}`;
+    const r = await fetch(apiUrl, { headers: { ...NSE_BASE_HEADERS, Cookie: cookies }, timeout: 15000 });
+    const json = await r.json();
+    const records   = json?.records?.data       || [];
+    const expDates  = json?.records?.expiryDates|| [];
+    const spotPrice = json?.records?.underlyingValue || 0;
+    const nearExpiry = expDates[0] || '';
+    const nearRecords = records.filter(d => d.expiryDate === nearExpiry);
+
+    // Max Pain
+    const strikes = [...new Set(nearRecords.map(d => d.strikePrice))].sort((a,b)=>a-b);
+    let maxPainStrike = 0, minLoss = Infinity;
+    for (const ts of strikes) {
+      let loss = 0;
+      for (const d of nearRecords) {
+        if (ts < d.strikePrice) loss += (d.strikePrice - ts) * (d.CE?.openInterest || 0);
+        if (ts > d.strikePrice) loss += (ts - d.strikePrice) * (d.PE?.openInterest || 0);
+      }
+      if (loss < minLoss) { minLoss = loss; maxPainStrike = ts; }
+    }
+
+    // PCR
+    let totalCE_OI=0, totalPE_OI=0, totalCE_Vol=0, totalPE_Vol=0;
+    for (const d of nearRecords) {
+      totalCE_OI  += d.CE?.openInterest      || 0;
+      totalPE_OI  += d.PE?.openInterest      || 0;
+      totalCE_Vol += d.CE?.totalTradedVolume || 0;
+      totalPE_Vol += d.PE?.totalTradedVolume || 0;
+    }
+    const pcrOI  = totalCE_OI  ? +(totalPE_OI  / totalCE_OI ).toFixed(3) : 0;
+    const pcrVol = totalCE_Vol ? +(totalPE_Vol / totalCE_Vol).toFixed(3) : 0;
+
+    // Top OI strikes
+    const topCE = [...nearRecords].sort((a,b)=>(b.CE?.openInterest||0)-(a.CE?.openInterest||0))
+      .slice(0,3).map(d=>({ strike:d.strikePrice, oi:d.CE?.openInterest||0, ltp:d.CE?.lastPrice||0, iv:d.CE?.impliedVolatility||0 }));
+    const topPE = [...nearRecords].sort((a,b)=>(b.PE?.openInterest||0)-(a.PE?.openInterest||0))
+      .slice(0,3).map(d=>({ strike:d.strikePrice, oi:d.PE?.openInterest||0, ltp:d.PE?.lastPrice||0, iv:d.PE?.impliedVolatility||0 }));
+
+    // ATM & straddle
+    const atmStrike = strikes.reduce((p,c) => Math.abs(c-spotPrice)<Math.abs(p-spotPrice)?c:p, strikes[0]||0);
+    const atmRow = nearRecords.find(d => d.strikePrice === atmStrike) || {};
+    const straddlePremium = (atmRow.CE?.lastPrice||0) + (atmRow.PE?.lastPrice||0);
+    const atmIV = ((atmRow.CE?.impliedVolatility||0) + (atmRow.PE?.impliedVolatility||0)) / 2;
+
+    // OI chart data (for visualization)
+    const oiChartData = nearRecords
+      .filter(d => Math.abs(d.strikePrice - spotPrice) < spotPrice * 0.05) // ±5% of spot
+      .sort((a,b) => a.strikePrice - b.strikePrice)
+      .map(d => ({
+        strike: d.strikePrice,
+        ceOI: d.CE?.openInterest || 0,
+        peOI: d.PE?.openInterest || 0,
+        ceLTP: d.CE?.lastPrice || 0,
+        peLTP: d.PE?.lastPrice || 0,
+        ceIV: d.CE?.impliedVolatility || 0,
+        peIV: d.PE?.impliedVolatility || 0,
+      }));
+
+    res.json({
+      symbol, spotPrice, nearExpiry,
+      maxPain: { strike: maxPainStrike, pct: +((maxPainStrike-spotPrice)/spotPrice*100).toFixed(2) },
+      pcr: { oi: pcrOI, volume: pcrVol, bias: pcrOI>1.2?'Bullish':pcrOI<0.8?'Bearish':'Neutral' },
+      resistance: topCE, support: topPE,
+      atmStrike, atmIV: +atmIV.toFixed(2),
+      straddlePremium: +straddlePremium.toFixed(2),
+      expectedMove: { up: +(spotPrice+straddlePremium).toFixed(0), down: +(spotPrice-straddlePremium).toFixed(0) },
+      oiChartData,
+      fetchedAt: new Date().toISOString(),
+    });
+  } catch(e) { res.status(502).json({ error: e.message }); }
+});
+
 app.get('/api/health', (req, res) => {
   res.json({
     status        : 'ok',

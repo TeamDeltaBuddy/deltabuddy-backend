@@ -783,12 +783,17 @@ async function askAI(prompt, groqModel = 'llama-3.1-8b-instant') {
 // ── ALERT ENGINE — RSS-based, AI-first smart filtering ────────────────────────
 
 const RSS_FEEDS = [
-  'https://feeds.feedburner.com/ndtvnews-top-stories',
-  'https://timesofindia.indiatimes.com/rssfeedstopstories.cms',
-  'https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms',
-  'https://www.moneycontrol.com/rss/MCtopnews.xml',
-  'https://feeds.reuters.com/reuters/INtopNews',
+  // Reuters — globally accessible, finance-focused
   'https://feeds.reuters.com/reuters/businessNews',
+  'https://feeds.reuters.com/reuters/INtopNews',
+  // Financial Times RSS
+  'https://www.ft.com/rss/home/uk',
+  // Yahoo Finance India
+  'https://finance.yahoo.com/rss/2.0/headline?s=^NSEI&region=IN&lang=en-IN',
+  // Investing.com India news
+  'https://www.investing.com/rss/news_25.rss',
+  // NDTV Business
+  'https://feeds.feedburner.com/ndtvprofit-latest',
 ];
 
 // First-pass filter — only pass news that could plausibly move markets
@@ -1188,7 +1193,7 @@ app.get('/api/rss-news', async (req, res) => {
         url        : item.link,
         title      : item.title,
         description: item.description,
-        source     : new URL(item.link || 'https://example.com').hostname.replace('www.',''),
+        source     : { name: new URL(item.link || 'https://example.com').hostname.replace('www.','') },
         publishedAt: item.pubDate || new Date().toISOString(),
       }));
     res.json({ articles });

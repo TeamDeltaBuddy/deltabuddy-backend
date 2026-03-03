@@ -1445,6 +1445,76 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// ── EXPIRY TOOLS — Max Pain, PCR, OI Chart ────────────────────────────────────
+app.get('/api/expiry-tools', async (req, res) => {
+  const symbol = (req.query.symbol || 'NIFTY').toUpperCase();
+  try {
+    // Fetch NSE option chain
+    const nseUrl = `https://www.nseindia.com/api/option-chain-indices?symbol=${symbol}`;
+    const r = await fetch(nseUrl, {
+      headers: {
+        'User-Agent'  : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept'      : 'application/json',
+        'Referer'     : 'https://www.nseindia.com/option-chain',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+    });
+    if (!r.ok) throw new Error(`NSE returned ${r.status}`);
+    const json = await r.json();
+    const records = json?.records?.data || [];
+    const expiry  = json?.records?.expiryDates?.[0] || '';
+    const spot    = json?.records?.underlyingValue || 0;
+
+    // Aggregate CE and PE OI per strike
+    const strikeMap = {};
+    for (const rec of records) {
+      const k = rec.strikePrice;
+      if (!strikeMap[k]) strikeMap[k] = { strike:k, ceOI:0, peOI:0, ceLTP:0, peLTP:0, ceIV:0, peIV:0, ceVol:0, peVol:0 };
+      if (rec.CE) { strikeMap[k].ceOI += rec.CE.openInterest||0; strikeMap[k].ceLTP = rec.CE.lastPrice||0; strikeMap[k].ceIV = rec.CE.impliedVolatility||0; strikeMap[k].ceVol += rec.CE.totalTradedVolume||0; }
+      if (rec.PE) { strikeMap[k].peOI += rec.PE.openInterest||0; strikeMap[k].peLTP = rec.PE.lastPrice||0; strikeMap[k].peIV = rec.PE.impliedVolatility||0; strikeMap[k].peVol += rec.PE.totalTradedVolume||0; }
+    }
+    const strikes = Object.values(strikeMap).sort((a,b) => a.strike - b.strike);
+
+    // Max Pain — strike where total option writer loss is minimum
+    let maxPainStrike = spot, minLoss = Infinity;
+    for (const test of strikes) {
+      const S = test.strike;
+      let loss = 0;
+      for (const s of strikes) {
+        if (S > s.strike) loss += (S - s.strike) * s.ceOI;
+        if (S < s.strike) loss += (s.strike - S) * s.peOI;
+      }
+      if (loss < minLoss) { minLoss = loss; maxPainStrike = S; }
+    }
+
+    // PCR
+    const totalCeOI  = strikes.reduce((s,r) => s + r.ceOI,  0);
+    const totalPeOI  = strikes.reduce((s,r) => s + r.peOI,  0);
+    const totalCeVol = strikes.reduce((s,r) => s + r.ceVol, 0);
+    const totalPeVol = strikes.reduce((s,r) => s + r.peVol, 0);
+    const pcrOI  = totalCeOI  ? +(totalPeOI  / totalCeOI).toFixed(2)  : 0;
+    const pcrVol = totalCeVol ? +(totalPeVol / totalCeVol).toFixed(2) : 0;
+    const pcrBias = pcrOI > 1.2 ? 'Bullish' : pcrOI < 0.8 ? 'Bearish' : 'Neutral';
+
+    // ATM strike and straddle
+    const atmStrike = strikes.reduce((prev, s) => Math.abs(s.strike - spot) < Math.abs(prev.strike - spot) ? s : prev, strikes[0] || {strike:0});
+    const straddlePremium = (atmStrike.ceLTP || 0) + (atmStrike.peLTP || 0);
+    const atmIV = ((atmStrike.ceIV || 0) + (atmStrike.peIV || 0)) / 2;
+    const expectedMove = +(spot * atmIV / 100 / Math.sqrt(365)).toFixed(0);
+
+    // OI chart — ±5% from spot
+    const oiChart = strikes.filter(s => Math.abs(s.strike - spot) / spot <= 0.05);
+
+    // Key resistance (top CE OI) and support (top PE OI)
+    const resistance = [...strikes].sort((a,b) => b.ceOI - a.ceOI).slice(0,3);
+    const support    = [...strikes].sort((a,b) => b.peOI - a.peOI).slice(0,3);
+
+    res.json({ symbol, expiry, spot, maxPain: maxPainStrike, pcrOI, pcrVol, pcrBias, straddlePremium, atmIV: +atmIV.toFixed(1), expectedMove, resistance, support, oiChart });
+  } catch(e) {
+    res.status(502).json({ error: e.message, symbol });
+  }
+});
+
 // ── Start ──────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n🚀 DeltaBuddy Backend on port ${PORT}`);

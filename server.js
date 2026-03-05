@@ -502,6 +502,41 @@ async function sendTelegramAlert(chatIds, message) {
   }
 }
 
+// ── FIREBASE ADMIN — read all user Chat IDs from Firestore ───────────────────
+let db_admin = null;
+try {
+  const admin = require('firebase-admin');
+  const svcAccount = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (svcAccount && !admin.apps.length) {
+    admin.initializeApp({
+      credential: admin.credential.cert(JSON.parse(svcAccount)),
+    });
+    db_admin = admin.firestore();
+    console.log('[Firebase] Admin SDK initialized');
+  }
+} catch(e) {
+  console.warn('[Firebase] Admin SDK not available:', e.message);
+}
+
+// Load all tgChatIds from Firestore users collection
+async function loadSubscribersFromFirestore() {
+  if (!db_admin) return;
+  try {
+    const snap = await db_admin.collection('users').get();
+    let added = 0;
+    snap.forEach(doc => {
+      const { tgChatId } = doc.data();
+      if (tgChatId && String(tgChatId).trim()) {
+        alertSubscribers.add(String(tgChatId).trim());
+        added++;
+      }
+    });
+    console.log(`[Firebase] Loaded ${added} subscriber(s) from Firestore. Total: ${alertSubscribers.size}`);
+  } catch(e) {
+    console.warn('[Firebase] Could not load subscribers:', e.message);
+  }
+}
+
 // In-memory subscriber store — seeded from env var on startup
 // TG_CHAT_IDS = comma-separated list e.g. "123456789,987654321"
 const alertSubscribers = new Set(
@@ -512,7 +547,7 @@ const alertSubscribers = new Set(
 console.log(`[Alerts] Loaded ${alertSubscribers.size} subscriber(s) from env vars.`);
 
 // POST /api/alert-subscribe
-app.post('/api/alert-subscribe', (req, res) => {
+app.post('/api/alert-subscribe', async (req, res) => {
   const { chat_id } = req.body;
   if (!chat_id) return res.status(400).json({ error: 'chat_id required' });
   alertSubscribers.add(String(chat_id));
@@ -1090,6 +1125,135 @@ app.get('/api/expiry-tools', async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// MULTI-BROKER SUPPORT — Zerodha Kite + Angel One
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── ZERODHA KITE ─────────────────────────────────────────────────────────────
+// User must provide their own Kite API key + access token
+// Access token is generated daily via Kite login flow
+
+async function zerodhaAPI(path, accessToken, method = 'GET', body = null) {
+  const opts = {
+    method,
+    headers: {
+      'X-Kite-Version': '3',
+      'Authorization' : `token ${process.env.ZERODHA_API_KEY}:${accessToken}`,
+      'Content-Type'  : 'application/x-www-form-urlencoded',
+    },
+  };
+  if (body) opts.body = new URLSearchParams(body).toString();
+  const r = await fetch(`https://api.kite.trade${path}`, opts);
+  const data = await r.json();
+  if (data.status === 'error') throw new Error(data.message || 'Zerodha API error');
+  return data.data || data;
+}
+
+// GET /api/zerodha/portfolio?access_token=xxx
+app.get('/api/zerodha/portfolio', async (req, res) => {
+  const token = req.query.access_token || req.headers['x-zerodha-token'];
+  if (!token) return res.status(400).json({ error: 'access_token required' });
+  try {
+    const [positions, holdings, margins] = await Promise.all([
+      zerodhaAPI('/portfolio/positions', token).catch(e => ({ error: e.message })),
+      zerodhaAPI('/portfolio/holdings',  token).catch(e => ({ error: e.message })),
+      zerodhaAPI('/user/margins',        token).catch(e => ({ error: e.message })),
+    ]);
+    res.json({ broker: 'zerodha', positions, holdings, margins });
+  } catch(e) { res.status(502).json({ error: e.message }); }
+});
+
+// GET /api/zerodha/orders?access_token=xxx
+app.get('/api/zerodha/orders', async (req, res) => {
+  const token = req.query.access_token || req.headers['x-zerodha-token'];
+  if (!token) return res.status(400).json({ error: 'access_token required' });
+  try {
+    const data = await zerodhaAPI('/orders', token);
+    res.json(data);
+  } catch(e) { res.status(502).json({ error: e.message }); }
+});
+
+// GET /api/zerodha/login-url — generate Kite login URL for user
+app.get('/api/zerodha/login-url', (req, res) => {
+  const apiKey = process.env.ZERODHA_API_KEY;
+  if (!apiKey) return res.status(503).json({ error: 'ZERODHA_API_KEY not configured' });
+  res.json({ url: `https://kite.trade/connect/login?api_key=${apiKey}&v=3` });
+});
+
+// POST /api/zerodha/session — exchange request_token for access_token
+app.post('/api/zerodha/session', async (req, res) => {
+  const { request_token } = req.body;
+  const apiKey    = process.env.ZERODHA_API_KEY;
+  const apiSecret = process.env.ZERODHA_API_SECRET;
+  if (!apiKey || !apiSecret) return res.status(503).json({ error: 'Zerodha keys not configured' });
+  if (!request_token) return res.status(400).json({ error: 'request_token required' });
+  try {
+    const crypto = require('crypto');
+    const checksum = crypto.createHash('sha256')
+      .update(apiKey + request_token + apiSecret).digest('hex');
+    const r = await fetch('https://api.kite.trade/session/token', {
+      method: 'POST',
+      headers: { 'X-Kite-Version': '3', 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ api_key: apiKey, request_token, checksum }).toString(),
+    });
+    const data = await r.json();
+    if (data.status === 'error') throw new Error(data.message);
+    res.json({ access_token: data.data.access_token, user: data.data.user_name });
+  } catch(e) { res.status(502).json({ error: e.message }); }
+});
+
+// ── ANGEL ONE ────────────────────────────────────────────────────────────────
+// User provides their own Angel API key + JWT token
+// JWT token obtained by user logging in separately
+
+async function angelOneAPI(path, jwtToken, method = 'GET', body = null) {
+  const apiKey = process.env.ANGEL_API_KEY_SHARED || req?.headers?.['x-angel-apikey'];
+  const opts = {
+    method,
+    headers: {
+      'Content-Type'   : 'application/json',
+      'Accept'         : 'application/json',
+      'X-UserType'     : 'USER',
+      'X-SourceID'     : 'WEB',
+      'X-ClientLocalIP': '127.0.0.1',
+      'X-ClientPublicIP': '127.0.0.1',
+      'X-MACAddress'   : '00:00:00:00:00:00',
+      'X-PrivateKey'   : apiKey || '',
+      'Authorization'  : `Bearer ${jwtToken}`,
+    },
+  };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(`https://apiconnect.angelone.in${path}`, opts);
+  const data = await r.json();
+  if (data.status === false) throw new Error(data.message || 'Angel One API error');
+  return data.data || data;
+}
+
+// GET /api/angel/portfolio?jwt=xxx&apikey=xxx
+app.get('/api/angel/portfolio', async (req, res) => {
+  const jwt    = req.query.jwt || req.headers['x-angel-jwt'];
+  const apiKey = req.query.apikey || req.headers['x-angel-apikey'];
+  if (!jwt) return res.status(400).json({ error: 'jwt token required' });
+  try {
+    const headers = {
+      'Content-Type': 'application/json', 'Accept': 'application/json',
+      'X-UserType': 'USER', 'X-SourceID': 'WEB',
+      'X-ClientLocalIP': '127.0.0.1', 'X-ClientPublicIP': '127.0.0.1',
+      'X-MACAddress': '00:00:00:00:00:00',
+      'X-PrivateKey': apiKey || '', 'Authorization': `Bearer ${jwt}`,
+    };
+    const [positions, holdings, rms] = await Promise.all([
+      fetch('https://apiconnect.angelone.in/rest/secure/angelbroking/order/v1/getPosition', { headers })
+        .then(r=>r.json()).catch(e=>({ error: e.message })),
+      fetch('https://apiconnect.angelone.in/rest/secure/angelbroking/portfolio/v1/getAllHolding', { headers })
+        .then(r=>r.json()).catch(e=>({ error: e.message })),
+      fetch('https://apiconnect.angelone.in/rest/secure/angelbroking/user/v1/getRMS', { headers })
+        .then(r=>r.json()).catch(e=>({ error: e.message })),
+    ]);
+    res.json({ broker: 'angelone', positions: positions.data, holdings: holdings.data, funds: rms.data });
+  } catch(e) { res.status(502).json({ error: e.message }); }
+});
+
 // ── Start ──────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n🚀 DeltaBuddy Backend on port ${PORT}`);
@@ -1099,6 +1263,10 @@ app.listen(PORT, () => {
   console.log(`[Dhan] Configured: ${!!(DHAN_CLIENT_ID && DHAN_ACCESS_TOKEN)}`);
   getNSECookies();
   startAlertEngine();
+
+  // Load subscribers from Firestore then refresh every 5 minutes
+  loadSubscribersFromFirestore();
+  setInterval(loadSubscribersFromFirestore, 5 * 60 * 1000);
 
   // ── Keep-alive ping so Render free tier never sleeps ──────────────────
   const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;

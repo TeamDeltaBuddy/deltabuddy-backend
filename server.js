@@ -19,520 +19,96 @@ const limiter = rateLimit({ windowMs: 60*1000, max: 200, message: { error: 'Too 
 app.use(limiter);
 
 // ══════════════════════════════════════════════════════════════════════════════
-// ANGEL ONE WEBSOCKET MANAGER
+// DHAN BROKER INTEGRATION
 // ══════════════════════════════════════════════════════════════════════════════
 
-const ANGEL_API_KEY   = process.env.ANGEL_API_KEY;
-const ANGEL_CLIENT_ID = process.env.ANGEL_CLIENT_ID;
-const ANGEL_MPIN      = process.env.ANGEL_MPIN;
-const ANGEL_TOTP_KEY  = process.env.ANGEL_TOTP_KEY; // TOTP secret
+const DHAN_CLIENT_ID    = process.env.DHAN_CLIENT_ID;
+const DHAN_ACCESS_TOKEN = process.env.DHAN_ACCESS_TOKEN;
+const DHAN_BASE_URL     = process.env.DHAN_BASE_URL || 'https://api.dhan.co';
 
-// In-memory tick store — keyed by token
-const tickStore = {};          // { "26000": { ltp, open, high, low, close, volume, bidQty, askQty, bidPrice, askPrice, depth } }
-let angelToken    = null;      // JWT auth token
-let angelFeedToken = null;     // WebSocket feed token
-let angelWs       = null;      // Active WebSocket connection
-let angelConnected = false;
-let angelLoginTime = 0;
-let subscribedTokens = new Set();
-
-// Token → symbol name mapping (expandable)
-const TOKEN_SYMBOL_MAP = {
-  '26000': 'NIFTY 50',
-  '26009': 'BANK NIFTY',
-  '26037': 'NIFTY IT',
-  '26003': 'NIFTY NEXT 50',
-  '26013': 'NIFTY MIDCAP 50',
-};
-
-// Exchange type constants
-const EXCHANGE_NSE = 1;  // NSE CM
-const EXCHANGE_NFO = 2;  // NSE F&O (options/futures)
-
-// Mode constants
-const MODE_LTP       = 1;  // LTP only
-const MODE_QUOTE     = 2;  // LTP + bid/ask + volume
-const MODE_SNAPQUOTE = 3;  // Full market depth (5 levels)
-
-// ── Angel One Login ───────────────────────────────────────────────────────────
-let angelLoginError = '';
-
-async function angelLogin() {
-  if (!ANGEL_API_KEY || !ANGEL_CLIENT_ID || !ANGEL_MPIN || !ANGEL_TOTP_KEY) {
-    angelLoginError = 'Missing env vars';
-    console.log('[Angel] Missing credentials — need ANGEL_API_KEY, ANGEL_CLIENT_ID, ANGEL_MPIN, ANGEL_TOTP_KEY');
-    return false;
-  }
-
-  try {
-    // Add base32 padding if missing (Angel One secret may not have = padding)
-    let totpSecret = ANGEL_TOTP_KEY.replace(/\s/g, '').toUpperCase();
-    while (totpSecret.length % 8 !== 0) totpSecret += '=';
-    
-    // Allow ±1 window (30s tolerance for server clock drift)
-    totp.options = { digits: 6, step: 30, window: 1, algorithm: 'sha1' };
-    const totpCode = totp.generate(totpSecret);
-    console.log(`[Angel] Logging in as ${ANGEL_CLIENT_ID}, TOTP=${totpCode}, secret_len=${totpSecret.length}...`);
-
-    const res = await fetch('https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword', {
-      method : 'POST',
-      headers: {
-        'Content-Type'    : 'application/json',
-        'Accept'          : 'application/json',
-        'X-UserType'      : 'USER',
-        'X-SourceID'      : 'WEB',
-        'X-ClientLocalIP' : '127.0.0.1',
-        'X-ClientPublicIP': '106.51.0.1',
-        'X-MACAddress'    : 'AA:BB:CC:DD:EE:FF',
-        'X-PrivateKey'    : ANGEL_API_KEY,
-      },
-      body: JSON.stringify({
-        clientcode: ANGEL_CLIENT_ID,
-        password  : ANGEL_MPIN,
-        totp      : totpCode,
-      }), // totp is 6-digit code
-      timeout: 15000,
-    });
-
-    const raw = await res.text();
-    console.log(`[Angel] Login response (${res.status}):`, raw.substring(0, 300));
-
-    const data = JSON.parse(raw);
-    if (data.status && data.data?.jwtToken) {
-      angelToken      = data.data.jwtToken;
-      angelFeedToken  = data.data.feedToken;
-      angelLoginTime  = Date.now();
-      angelLoginError = '';
-      console.log('[Angel] ✅ Login successful! feedToken:', angelFeedToken?.substring(0,20) + '...');
-      return true;
-    } else {
-      angelLoginError = data.message || data.errorcode || JSON.stringify(data);
-      console.error('[Angel] ❌ Login failed:', angelLoginError);
-      return false;
-    }
-  } catch(e) {
-    angelLoginError = e.message;
-    console.error('[Angel] ❌ Login exception:', e.message);
-    return false;
-  }
-}
-
-// ── Angel One WebSocket Connect ───────────────────────────────────────────────
-function connectAngelWS() {
-  if (!angelToken || !angelFeedToken) {
-    console.log('[Angel WS] No token — cannot connect');
-    return;
-  }
-  if (angelWs && angelWs.readyState === WebSocket.OPEN) {
-    console.log('[Angel WS] Already connected');
-    return;
-  }
-
-  console.log('[Angel WS] Connecting...');
-  angelWs = new WebSocket('wss://smartapisocket.angelone.in/smart-stream', {
-    headers: {
-      'Authorization': `Bearer ${angelToken}`,
-      'x-api-key'    : ANGEL_API_KEY,
-      'x-client-code': ANGEL_CLIENT_ID,
-      'x-feed-token' : angelFeedToken,
-    }
-  });
-
-  angelWs.on('open', () => {
-    angelConnected = true;
-    console.log('[Angel WS] Connected ✅');
-    // Re-subscribe all tokens
-    if (subscribedTokens.size > 0) {
-      subscribeTokens([...subscribedTokens], MODE_SNAPQUOTE);
-    } else {
-      // Default: subscribe NIFTY + BANKNIFTY in SnapQuote mode
-      subscribeTokens(['26000','26009','26037'], MODE_SNAPQUOTE, EXCHANGE_NSE);
-    }
-  });
-
-  angelWs.on('message', (rawData) => {
-    try {
-      // Angel One sends binary data
-      if (Buffer.isBuffer(rawData)) {
-        parseBinaryTick(rawData);
-      } else {
-        const msg = JSON.parse(rawData.toString());
-        console.log('[Angel WS] Message:', msg);
-      }
-    } catch(e) {
-      // ignore parse errors
-    }
-  });
-
-  angelWs.on('close', (code, reason) => {
-    angelConnected = false;
-    console.log(`[Angel WS] Disconnected (${code}) — reconnecting in 5s...`);
-    setTimeout(() => reconnectAngel(), 5000);
-  });
-
-  angelWs.on('error', (err) => {
-    angelConnected = false;
-    console.error('[Angel WS] Error:', err.message);
-  });
-}
-
-// ── Parse Binary Tick Data ────────────────────────────────────────────────────
-function parseBinaryTick(buf) {
-  try {
-    // Angel One binary packet format:
-    // Byte 0: subscription type (1=LTP, 2=Quote, 3=SnapQuote)
-    // Byte 1: exchange type
-    // Bytes 2-27: token (padded string)
-    // Bytes 28-35: sequence number
-    // Bytes 36-43: exchange timestamp
-    // Bytes 44-51: last traded price (divide by 100)
-    // Bytes 52-59: last traded quantity
-    // Bytes 60-67: average traded price
-    // Bytes 68-75: volume traded today
-    // Bytes 76-83: total buy qty
-    // Bytes 84-91: total sell qty
-    // Bytes 92-99: open
-    // Bytes 100-107: high
-    // Bytes 108-115: low
-    // Bytes 116-123: close
-    // (SnapQuote has additional depth data)
-
-    const mode = buf.readUInt8(0);
-    const exchangeType = buf.readUInt8(1);
-    const token = buf.slice(2, 27).toString('ascii').replace(/\0/g, '').trim();
-
-    if (!token) return;
-
-    const ltp   = buf.readBigInt64BE(44) ? Number(buf.readBigInt64BE(44)) / 100 : 0;
-    const open  = buf.length > 92  ? Number(buf.readBigInt64BE(92))  / 100 : 0;
-    const high  = buf.length > 100 ? Number(buf.readBigInt64BE(100)) / 100 : 0;
-    const low   = buf.length > 108 ? Number(buf.readBigInt64BE(108)) / 100 : 0;
-    const close = buf.length > 116 ? Number(buf.readBigInt64BE(116)) / 100 : 0;
-    const vol   = buf.length > 68  ? Number(buf.readBigInt64BE(68))  : 0;
-
-    const tick = {
-      token,
-      symbol  : TOKEN_SYMBOL_MAP[token] || token,
-      exchange: exchangeType,
-      ltp     : ltp > 0 ? ltp : (tickStore[token]?.ltp || 0),
-      open, high, low, close,
-      volume  : vol,
-      change  : close > 0 ? ((ltp - close) / close * 100).toFixed(2) : 0,
-      timestamp: Date.now(),
-    };
-
-    // Parse SnapQuote depth (bytes 124+)
-    if (mode === 3 && buf.length > 124) {
-      tick.depth = parseDepth(buf, 124);
-      tick.bidPrice = tick.depth?.buy?.[0]?.price || 0;
-      tick.askPrice = tick.depth?.sell?.[0]?.price || 0;
-      tick.bidQty   = tick.depth?.buy?.[0]?.qty   || 0;
-      tick.askQty   = tick.depth?.sell?.[0]?.qty   || 0;
-    }
-
-    // Parse Quote mode bid/ask (bytes 76-91)
-    if (mode >= 2 && buf.length > 91) {
-      tick.totalBuyQty  = Number(buf.readBigInt64BE(76));
-      tick.totalSellQty = Number(buf.readBigInt64BE(84));
-    }
-
-    tickStore[token] = tick;
-  } catch(e) {
-    // Silently ignore parse errors for malformed packets
-  }
-}
-
-function parseDepth(buf, offset) {
-  const depth = { buy: [], sell: [] };
-  try {
-    // 5 levels × (qty 8 bytes + price 8 bytes + orders 2 bytes) = 18 bytes each
-    // Buy first, then sell
-    for (let i = 0; i < 5; i++) {
-      const base = offset + i * 18;
-      if (base + 18 > buf.length) break;
-      depth.buy.push({
-        qty   : Number(buf.readBigInt64BE(base)),
-        price : Number(buf.readBigInt64BE(base + 8)) / 100,
-        orders: buf.readUInt16BE(base + 16),
-      });
-    }
-    const sellOffset = offset + 5 * 18;
-    for (let i = 0; i < 5; i++) {
-      const base = sellOffset + i * 18;
-      if (base + 18 > buf.length) break;
-      depth.sell.push({
-        qty   : Number(buf.readBigInt64BE(base)),
-        price : Number(buf.readBigInt64BE(base + 8)) / 100,
-        orders: buf.readUInt16BE(base + 16),
-      });
-    }
-  } catch(e) {}
-  return depth;
-}
-
-// ── Subscribe to Tokens ───────────────────────────────────────────────────────
-function subscribeTokens(tokens, mode = MODE_SNAPQUOTE, exchange = EXCHANGE_NSE) {
-  if (!angelWs || angelWs.readyState !== WebSocket.OPEN) return;
-
-  tokens.forEach(t => subscribedTokens.add(t));
-
-  const payload = {
-    correlationID: 'db_' + Date.now(),
-    action: 1, // 1=subscribe, 0=unsubscribe
-    params: {
-      mode,
-      tokenList: [{
-        exchangeType: exchange,
-        tokens: tokens.map(String),
-      }]
-    }
-  };
-
-  angelWs.send(JSON.stringify(payload));
-  console.log(`[Angel WS] Subscribed mode=${mode} tokens=${tokens.join(',')} exchange=${exchange}`);
-}
-
-function unsubscribeTokens(tokens, exchange = EXCHANGE_NSE) {
-  if (!angelWs || angelWs.readyState !== WebSocket.OPEN) return;
-  tokens.forEach(t => subscribedTokens.delete(t));
-  const payload = {
-    correlationID: 'db_unsub_' + Date.now(),
-    action: 0,
-    params: { mode: MODE_SNAPQUOTE, tokenList: [{ exchangeType: exchange, tokens: tokens.map(String) }] }
-  };
-  angelWs.send(JSON.stringify(payload));
-}
-
-// ── Reconnect Logic ───────────────────────────────────────────────────────────
-async function reconnectAngel() {
-  // Re-login every 8 hours (token expires)
-  const tokenAge = Date.now() - angelLoginTime;
-  if (tokenAge > 8 * 60 * 60 * 1000) {
-    console.log('[Angel] Token expired — re-logging in...');
-    await angelLogin();
-  }
-  connectAngelWS();
-}
-
-// ── Initial Connection on Startup ─────────────────────────────────────────────
-(async () => {
-  if (ANGEL_API_KEY) {
-    const ok = await angelLogin();
-    if (ok) connectAngelWS();
-  }
-})();
-
-// Re-login every 8 hours to keep token fresh
-setInterval(async () => {
-  if (ANGEL_API_KEY) {
-    console.log('[Angel] Scheduled re-login...');
-    await angelLogin();
-    if (angelWs) angelWs.close(); // triggers reconnect
-  }
-}, 8 * 60 * 60 * 1000);
-
-// ══════════════════════════════════════════════════════════════════════════════
-// ANGEL ONE REST ENDPOINTS
-// ══════════════════════════════════════════════════════════════════════════════
-
-// GET /api/angel/status — connection status
-app.get('/api/angel/status', (req, res) => {
-  res.json({
-    connected       : angelConnected,
-    tokenCount      : Object.keys(tickStore).length,
-    subscribedTokens: [...subscribedTokens],
-    loginTime       : angelLoginTime,
-    loginError      : angelLoginError || null,
-    hasCredentials  : !!ANGEL_API_KEY,
-    apiKey          : ANGEL_API_KEY ? ANGEL_API_KEY.substring(0,4)+'...' : null,
-    clientId        : ANGEL_CLIENT_ID || null,
-  });
-});
-
-// GET /api/angel/relogin — force re-login for debugging
-app.get('/api/angel/relogin', async (req, res) => {
-  const ok = await angelLogin();
-  if (ok) connectAngelWS();
-  res.json({ ok, error: angelLoginError || null, connected: angelConnected });
-});
-
-// GET /api/angel/ticks — all latest ticks
-app.get('/api/angel/ticks', (req, res) => {
-  res.json(tickStore);
-});
-
-// GET /api/angel/tick/:token — single token tick
-app.get('/api/angel/tick/:token', (req, res) => {
-  const tick = tickStore[req.params.token];
-  if (!tick) return res.status(404).json({ error: 'Token not found or not subscribed' });
-  res.json(tick);
-});
-
-// POST /api/angel/subscribe — subscribe new tokens
-// Body: { tokens: ["35001","35002"], mode: 3, exchange: 2 }
-app.post('/api/angel/subscribe', (req, res) => {
-  const { tokens = [], mode = MODE_SNAPQUOTE, exchange = EXCHANGE_NFO } = req.body;
-  if (!tokens.length) return res.status(400).json({ error: 'tokens array required' });
-
-  if (!angelConnected) {
-    return res.status(503).json({ error: 'Angel One WebSocket not connected', connected: false });
-  }
-
-  subscribeTokens(tokens, mode, exchange);
-  res.json({ ok: true, subscribed: tokens, mode, exchange });
-});
-
-// POST /api/angel/unsubscribe
-app.post('/api/angel/unsubscribe', (req, res) => {
-  const { tokens = [], exchange = EXCHANGE_NFO } = req.body;
-  unsubscribeTokens(tokens, exchange);
-  res.json({ ok: true, unsubscribed: tokens });
-});
-
-// GET /api/angel/option-ltp — get LTP for a list of option tokens
-// Query: tokens=35001,35002,35003
-app.get('/api/angel/option-ltp', (req, res) => {
-  const tokens = (req.query.tokens || '').split(',').filter(Boolean);
-  const result = {};
-  tokens.forEach(t => { result[t] = tickStore[t] || null; });
-  res.json(result);
-});
-
-// POST /api/angel/search-token — find token for a symbol/strike/expiry
-// Uses Angel One searchScrip REST API
-app.post('/api/angel/search-token', async (req, res) => {
-  if (!angelToken) return res.status(503).json({ error: 'Not logged in to Angel One' });
-  const { exchange = 'NFO', searchscrip } = req.body;
-
-  try {
-    const r = await fetch('https://apiconnect.angelone.in/rest/secure/angelbroking/order/v1/searchScrip', {
-      method : 'POST',
-      headers: {
-        'Content-Type' : 'application/json',
-        'Authorization': `Bearer ${angelToken}`,
-        'Accept'       : 'application/json',
-        'X-UserType'   : 'USER',
-        'X-SourceID'   : 'WEB',
-        'X-PrivateKey' : ANGEL_API_KEY,
-      },
-      body: JSON.stringify({ exchange, searchscrip }),
-      timeout: 10000,
-    });
-    const data = await r.json();
-    res.json(data);
-  } catch(e) {
-    res.status(502).json({ error: 'Search scrip failed', detail: e.message });
-  }
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-// ANGEL ONE — PORTFOLIO, ORDERS, GREEKS, EXPIRY TOOLS
-// ══════════════════════════════════════════════════════════════════════════════
-
-// Helper: make authenticated Angel One REST call
-async function angelREST(path, method='GET', body=null) {
-  if (!angelToken) throw new Error('Angel One not logged in');
+// Helper: make authenticated Dhan API call
+async function dhanAPI(path, method = 'GET', body = null) {
+  if (!DHAN_CLIENT_ID || !DHAN_ACCESS_TOKEN) throw new Error('Dhan credentials not configured');
   const opts = {
     method,
     headers: {
-      'Content-Type' : 'application/json',
-      'Authorization': `Bearer ${angelToken}`,
-      'Accept'       : 'application/json',
-      'X-UserType'   : 'USER',
-      'X-SourceID'   : 'WEB',
-      'X-ClientLocalIP': '127.0.0.1',
-      'X-ClientPublicIP': '127.0.0.1',
-      'X-MACAddress' : '00:00:00:00:00:00',
-      'X-PrivateKey' : ANGEL_API_KEY,
+      'Content-Type'  : 'application/json',
+      'access-token'  : DHAN_ACCESS_TOKEN,
+      'client-id'     : DHAN_CLIENT_ID,
     },
   };
   if (body) opts.body = JSON.stringify(body);
-  const r = await fetch(`https://apiconnect.angelone.in${path}`, opts);
-  return r.json();
+  const r = await fetch(`${DHAN_BASE_URL}${path}`, opts);
+  const text = await r.text();
+  try { return JSON.parse(text); } catch(e) { throw new Error(`Dhan API error ${r.status}: ${text.substring(0,200)}`); }
 }
 
-// GET /api/angel/portfolio — live positions + holdings
-app.get('/api/angel/portfolio', async (req, res) => {
-  if (!angelToken) return res.status(503).json({ error: 'Angel One not logged in', connected: false });
+// GET /api/dhan/status
+app.get('/api/dhan/status', (req, res) => {
+  res.json({
+    configured : !!(DHAN_CLIENT_ID && DHAN_ACCESS_TOKEN),
+    clientId   : DHAN_CLIENT_ID || 'NOT SET',
+    baseUrl    : DHAN_BASE_URL,
+  });
+});
+
+// GET /api/dhan/funds — account balance and limits
+app.get('/api/dhan/funds', async (req, res) => {
   try {
-    const [positions, holdings, funds] = await Promise.all([
-      angelREST('/rest/secure/angelbroking/order/v1/getPosition'),
-      angelREST('/rest/secure/angelbroking/portfolio/v1/getHolding'),
-      angelREST('/rest/secure/angelbroking/user/v1/getRMS'),
+    const data = await dhanAPI('/v2/fundlimit');
+    res.json(data);
+  } catch(e) { res.status(502).json({ error: e.message }); }
+});
+
+// GET /api/dhan/positions — current open positions
+app.get('/api/dhan/positions', async (req, res) => {
+  try {
+    const data = await dhanAPI('/v2/positions');
+    res.json(data);
+  } catch(e) { res.status(502).json({ error: e.message }); }
+});
+
+// GET /api/dhan/holdings — equity holdings
+app.get('/api/dhan/holdings', async (req, res) => {
+  try {
+    const data = await dhanAPI('/v2/holdings');
+    res.json(data);
+  } catch(e) { res.status(502).json({ error: e.message }); }
+});
+
+// GET /api/dhan/orders — order book
+app.get('/api/dhan/orders', async (req, res) => {
+  try {
+    const data = await dhanAPI('/v2/orders');
+    res.json(data);
+  } catch(e) { res.status(502).json({ error: e.message }); }
+});
+
+// GET /api/dhan/portfolio — combined funds + positions + holdings
+app.get('/api/dhan/portfolio', async (req, res) => {
+  try {
+    const [funds, positions, holdings] = await Promise.all([
+      dhanAPI('/v2/fundlimit').catch(e => ({ error: e.message })),
+      dhanAPI('/v2/positions').catch(e => ({ error: e.message })),
+      dhanAPI('/v2/holdings').catch(e => ({ error: e.message })),
     ]);
-    res.json({
-      positions: positions?.data || [],
-      holdings : holdings?.data || [],
-      funds    : funds?.data || {},
-      fetchedAt: new Date().toISOString(),
-    });
+    res.json({ funds, positions, holdings });
   } catch(e) { res.status(502).json({ error: e.message }); }
 });
 
-// GET /api/angel/orders — order book
-app.get('/api/angel/orders', async (req, res) => {
-  if (!angelToken) return res.status(503).json({ error: 'Angel One not logged in', connected: false });
+// POST /api/dhan/order — place an order
+app.post('/api/dhan/order', async (req, res) => {
   try {
-    const data = await angelREST('/rest/secure/angelbroking/order/v1/getOrderBook');
-    res.json({ orders: data?.data || [], fetchedAt: new Date().toISOString() });
+    const data = await dhanAPI('/v2/orders', 'POST', req.body);
+    res.json(data);
   } catch(e) { res.status(502).json({ error: e.message }); }
 });
 
-// GET /api/angel/tradebook — completed trades today
-app.get('/api/angel/tradebook', async (req, res) => {
-  if (!angelToken) return res.status(503).json({ error: 'Angel One not logged in', connected: false });
+// DELETE /api/dhan/order/:orderId — cancel an order
+app.delete('/api/dhan/order/:orderId', async (req, res) => {
   try {
-    const data = await angelREST('/rest/secure/angelbroking/order/v1/getTradeBook');
-    res.json({ trades: data?.data || [], fetchedAt: new Date().toISOString() });
-  } catch(e) { res.status(502).json({ error: e.message }); }
-});
-
-// POST /api/angel/place-order — place a real order
-// Body: { variety, tradingsymbol, symboltoken, transactiontype, exchange, ordertype, producttype, duration, price, squareoff, stoploss, quantity }
-app.post('/api/angel/place-order', async (req, res) => {
-  if (!angelToken) return res.status(503).json({ error: 'Angel One not logged in' });
-  const required = ['variety','tradingsymbol','symboltoken','transactiontype','exchange','ordertype','producttype','duration','quantity'];
-  for (const f of required) {
-    if (!req.body[f]) return res.status(400).json({ error: `Missing field: ${f}` });
-  }
-  try {
-    const data = await angelREST('/rest/secure/angelbroking/order/v1/placeOrder', 'POST', {
-      variety        : req.body.variety,        // NORMAL | STOPLOSS | AMO | ROBO
-      tradingsymbol  : req.body.tradingsymbol,  // e.g. NIFTY23DEC19500CE
-      symboltoken    : req.body.symboltoken,    // e.g. 35001
-      transactiontype: req.body.transactiontype,// BUY | SELL
-      exchange       : req.body.exchange,       // NFO | NSE | BSE
-      ordertype      : req.body.ordertype,      // MARKET | LIMIT | SL | SL-M
-      producttype    : req.body.producttype,    // INTRADAY | CARRYFORWARD | DELIVERY
-      duration       : req.body.duration,       // DAY | IOC
-      price          : req.body.price || '0',
-      squareoff      : req.body.squareoff || '0',
-      stoploss       : req.body.stoploss || '0',
-      quantity       : req.body.quantity.toString(),
-    });
-    console.log('[Order]', req.body.transactiontype, req.body.tradingsymbol, 'x', req.body.quantity, '→', data?.status);
-    if (data?.status === false) return res.status(400).json({ error: data.message || 'Order rejected' });
-    res.json({ ok: true, orderId: data?.data?.orderid, message: data?.message, data });
-  } catch(e) { res.status(502).json({ error: e.message }); }
-});
-
-// POST /api/angel/cancel-order
-app.post('/api/angel/cancel-order', async (req, res) => {
-  if (!angelToken) return res.status(503).json({ error: 'Angel One not logged in' });
-  const { orderid, variety = 'NORMAL' } = req.body;
-  if (!orderid) return res.status(400).json({ error: 'orderid required' });
-  try {
-    const data = await angelREST('/rest/secure/angelbroking/order/v1/cancelOrder', 'POST', { variety, orderid });
-    res.json({ ok: data?.status !== false, data });
-  } catch(e) { res.status(502).json({ error: e.message }); }
-});
-
-// POST /api/angel/modify-order
-app.post('/api/angel/modify-order', async (req, res) => {
-  if (!angelToken) return res.status(503).json({ error: 'Angel One not logged in' });
-  try {
-    const data = await angelREST('/rest/secure/angelbroking/order/v1/modifyOrder', 'POST', req.body);
-    res.json({ ok: data?.status !== false, data });
+    const data = await dhanAPI(`/v2/orders/${req.params.orderId}`, 'DELETE');
+    res.json(data);
   } catch(e) { res.status(502).json({ error: e.message }); }
 });
 
@@ -1438,8 +1014,7 @@ app.get('/api/health', (req, res) => {
   res.json({
     status        : 'ok',
     service       : 'DeltaBuddy Backend',
-    angelConnected: angelConnected,
-    tickCount     : Object.keys(tickStore).length,
+    dhanConfigured: !!(DHAN_CLIENT_ID && DHAN_ACCESS_TOKEN),
     uptime        : Math.floor(process.uptime()) + 's',
     timestamp     : new Date().toISOString(),
   });
@@ -1518,9 +1093,10 @@ app.get('/api/expiry-tools', async (req, res) => {
 // ── Start ──────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n🚀 DeltaBuddy Backend on port ${PORT}`);
-  console.log(`📊 Angel WS Status: http://localhost:${PORT}/api/angel/status`);
-  console.log(`📈 Live Ticks:      http://localhost:${PORT}/api/angel/ticks`);
+  console.log(`💼 Dhan Status:    http://localhost:${PORT}/api/dhan/status`);
+  console.log(`💰 Dhan Portfolio: http://localhost:${PORT}/api/dhan/portfolio`);
   console.log(`❤️  Health:         http://localhost:${PORT}/api/health\n`);
+  console.log(`[Dhan] Configured: ${!!(DHAN_CLIENT_ID && DHAN_ACCESS_TOKEN)}`);
   getNSECookies();
   startAlertEngine();
 

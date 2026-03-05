@@ -168,6 +168,163 @@ app.get('/api/option-chain', async (req, res) => {
   }
 });
 
+// ── GEX / GREEKS ANALYSIS ENDPOINT ────────────────────────────────────────────
+// Calculates Gamma Exposure (GEX), Delta Walls, Vanna, Charm from NSE OC data
+app.get('/api/gex', async (req, res) => {
+  const symbol  = (req.query.symbol || 'NIFTY').toUpperCase();
+  const isIndex = INDEX_SYMBOLS.includes(symbol);
+  const apiUrl  = isIndex
+    ? `https://www.nseindia.com/api/option-chain-indices?symbol=${symbol}`
+    : `https://www.nseindia.com/api/option-chain-equities?symbol=${symbol}`;
+
+  try {
+    const cookies = await getNSECookies();
+    const r = await fetch(apiUrl, { headers: { ...NSE_BASE_HEADERS, Cookie: cookies }, timeout: 15000 });
+    if (!r.ok) throw new Error(`NSE ${r.status}`);
+    const raw = await r.json();
+
+    const spot      = raw.records?.underlyingValue || 0;
+    const lotSize   = symbol === 'BANKNIFTY' ? 15 : symbol === 'FINNIFTY' ? 40 : symbol === 'MIDCPNIFTY' ? 50 : 75;
+    const rows      = raw.filtered?.data || raw.records?.data || [];
+
+    // Black-Scholes helpers
+    function erf(x) {
+      const a1=0.254829592,a2=-0.284496736,a3=1.421413741,a4=-1.453152027,a5=1.061405429,p=0.3275911;
+      const sign = x < 0 ? -1 : 1; x = Math.abs(x);
+      const t = 1/(1+p*x);
+      const y = 1-(((((a5*t+a4)*t)+a3)*t+a2)*t+a1)*t*Math.exp(-x*x);
+      return sign*y;
+    }
+    function normCDF(x) { return 0.5*(1+erf(x/Math.sqrt(2))); }
+    function normPDF(x) { return Math.exp(-0.5*x*x)/Math.sqrt(2*Math.PI); }
+
+    function bsGreeks(S, K, T, r, sigma, type) {
+      if (T <= 0 || sigma <= 0) return { delta:0, gamma:0, vanna:0, charm:0, theta:0 };
+      const d1 = (Math.log(S/K) + (r + 0.5*sigma*sigma)*T) / (sigma*Math.sqrt(T));
+      const d2 = d1 - sigma*Math.sqrt(T);
+      const nd1 = normPDF(d1);
+      const gamma  = nd1 / (S * sigma * Math.sqrt(T));
+      const delta  = type === 'CE' ? normCDF(d1) : normCDF(d1) - 1;
+      const vanna  = -nd1 * d2 / sigma;                                // dDelta/dVol
+      const charm  = type === 'CE'
+        ? -nd1 * (2*r*T - d2*sigma*Math.sqrt(T)) / (2*T*sigma*Math.sqrt(T))
+        : -nd1 * (2*r*T - d2*sigma*Math.sqrt(T)) / (2*T*sigma*Math.sqrt(T));
+      const theta  = type === 'CE'
+        ? (-S*nd1*sigma/(2*Math.sqrt(T)) - r*K*Math.exp(-r*T)*normCDF(d2)) / 365
+        : (-S*nd1*sigma/(2*Math.sqrt(T)) + r*K*Math.exp(-r*T)*normCDF(-d2)) / 365;
+      return { delta, gamma, vanna, charm, theta };
+    }
+
+    const now = new Date();
+    const strikes = {};
+
+    rows.forEach(row => {
+      const K = row.strikePrice;
+      if (!K) return;
+
+      ['CE','PE'].forEach(type => {
+        const opt = row[type];
+        if (!opt) return;
+        const expiry    = new Date(opt.expiryDate || row.expiryDate);
+        const T         = Math.max((expiry - now) / (1000*60*60*24*365), 0.001);
+        const iv        = (opt.impliedVolatility || opt.IV || 20) / 100;
+        const oi        = opt.openInterest || 0;
+        const oiChg     = opt.changeinOpenInterest || 0;
+        const g         = bsGreeks(spot, K, T, 0.065, iv, type);
+
+        if (!strikes[K]) strikes[K] = { strike:K, ceGEX:0, peGEX:0, ceDelta:0, peDelta:0, ceVanna:0, peVanna:0, ceCharm:0, peCharm:0, ceOI:0, peOI:0, ceOIChg:0, peOIChg:0, ceLTP:0, peLTP:0, ceIV:0, peIV:0 };
+
+        const contracts = oi * lotSize;
+        if (type === 'CE') {
+          strikes[K].ceGEX   = g.gamma * contracts * spot * spot * 0.01;
+          strikes[K].ceDelta = g.delta * contracts;
+          strikes[K].ceVanna = g.vanna * contracts;
+          strikes[K].ceCharm = g.charm * contracts;
+          strikes[K].ceOI    = oi;
+          strikes[K].ceOIChg = oiChg;
+          strikes[K].ceLTP   = opt.lastPrice || 0;
+          strikes[K].ceIV    = opt.impliedVolatility || 0;
+        } else {
+          strikes[K].peGEX   = g.gamma * contracts * spot * spot * 0.01;
+          strikes[K].peDelta = g.delta * contracts;
+          strikes[K].peVanna = g.vanna * contracts;
+          strikes[K].peCharm = g.charm * contracts;
+          strikes[K].peOI    = oi;
+          strikes[K].peOIChg = oiChg;
+          strikes[K].peLTP   = opt.lastPrice || 0;
+          strikes[K].peIV    = opt.impliedVolatility || 0;
+        }
+      });
+    });
+
+    const strikesArr = Object.values(strikes).sort((a,b) => a.strike - b.strike);
+
+    // Net GEX per strike (dealers are short calls, long puts => flip signs)
+    // Positive GEX = dealers buy on dips (stabilising), Negative = dealers sell (accelerating)
+    strikesArr.forEach(s => {
+      s.netGEX     = s.ceGEX - s.peGEX;
+      s.netDelta   = s.ceDelta + s.peDelta;
+      s.netVanna   = s.ceVanna + s.peVanna;
+      s.netCharm   = s.ceCharm + s.peCharm;
+    });
+
+    const totalGEX   = strikesArr.reduce((sum,s) => sum + s.netGEX, 0);
+
+    // Gamma flip - strike where net GEX crosses zero
+    let gammaFlip = null;
+    for (let i = 1; i < strikesArr.length; i++) {
+      if (strikesArr[i-1].netGEX * strikesArr[i].netGEX < 0) {
+        gammaFlip = strikesArr[i].strike;
+        break;
+      }
+    }
+
+    // Gamma walls (top 3 positive and negative GEX strikes)
+    const sorted = [...strikesArr].sort((a,b) => Math.abs(b.netGEX) - Math.abs(a.netGEX));
+    const posWalls = sorted.filter(s => s.netGEX > 0).slice(0,3).map(s => s.strike);
+    const negWalls = sorted.filter(s => s.netGEX < 0).slice(0,3).map(s => s.strike);
+
+    // Delta walls - top call OI and put OI (classic support/resistance)
+    const topCallOI = [...strikesArr].sort((a,b) => b.ceOI - a.ceOI).slice(0,3).map(s => s.strike);
+    const topPutOI  = [...strikesArr].sort((a,b) => b.peOI - a.peOI).slice(0,3).map(s => s.strike);
+
+    // Vanna flip - where vanna changes sign (vol-driven directional risk)
+    let vannaFlip = null;
+    for (let i = 1; i < strikesArr.length; i++) {
+      if (strikesArr[i-1].netVanna * strikesArr[i].netVanna < 0) {
+        vannaFlip = strikesArr[i].strike;
+        break;
+      }
+    }
+
+    // Charm weighted centre (time-decay pressure level)
+    const totalCharmAbs = strikesArr.reduce((sum,s) => sum + Math.abs(s.netCharm), 0);
+    const charmCentre = totalCharmAbs > 0
+      ? strikesArr.reduce((sum,s) => sum + s.strike * Math.abs(s.netCharm), 0) / totalCharmAbs
+      : spot;
+
+    // Zone classification
+    const aboveFlip = gammaFlip && spot > gammaFlip;
+    const zoneLabel = totalGEX > 0
+      ? (aboveFlip ? 'Positive Gamma - Pinning likely' : 'Positive Gamma - Range bound')
+      : 'Negative Gamma - Trend amplification';
+
+    res.json({
+      symbol, spot, lotSize, totalGEX: Math.round(totalGEX),
+      gammaFlip, vannaFlip, charmCentre: Math.round(charmCentre),
+      posWalls, negWalls, topCallOI, topPutOI,
+      zoneLabel,
+      regime: totalGEX > 0 ? 'positive' : 'negative',
+      strikes: strikesArr.slice(
+        Math.max(0, strikesArr.findIndex(s => s.strike >= spot * 0.97)),
+        strikesArr.findIndex(s => s.strike >= spot * 1.03) + 1
+      ),
+    });
+  } catch(e) {
+    res.status(502).json({ error: 'GEX calculation failed', detail: e.message });
+  }
+});
+
 app.get('/api/quote', async (req, res) => {
   const symbol = (req.query.symbol || 'NIFTY').toUpperCase();
   try {

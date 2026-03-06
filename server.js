@@ -402,6 +402,23 @@ app.get('/api/yahoo/quote/:symbol', async (req, res) => {
   res.json({ ...data, symbol: req.params.symbol });
 });
 
+// ── India VIX ─────────────────────────────────────────────────────────────────
+// India VIX Yahoo Finance ticker: ^INDIAVIX
+app.get('/api/vix', async (req, res) => {
+  try {
+    const data = await fetchYahooQuote('^INDIAVIX');
+    if (!data) throw new Error('No data');
+    const vix = data.price;
+    const change = data.change;
+    // Classify
+    const level = vix > 22 ? 'HIGH' : vix > 17 ? 'ELEVATED' : vix > 13 ? 'MODERATE' : 'LOW';
+    const color = vix > 22 ? 'red' : vix > 17 ? 'orange' : vix > 13 ? 'yellow' : 'green';
+    res.json({ vix, change, level, color });
+  } catch(e) {
+    res.status(502).json({ error: 'VIX fetch failed', detail: e.message });
+  }
+});
+
 // ── Groq AI Proxy ──────────────────────────────────────────────────────────────
 app.post('/api/groq', async (req, res) => {
   const apiKey = req.headers['x-groq-key'] || req.headers['authorization']?.replace('Bearer ','');

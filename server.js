@@ -1411,6 +1411,92 @@ app.get('/api/angel/portfolio', async (req, res) => {
   } catch(e) { res.status(502).json({ error: e.message }); }
 });
 
+// ── SCREENSHOT ANALYSIS — Claude Vision ───────────────────────────────────────
+// POST /api/analyze-screenshot
+// Body: { image: base64string, mediaType: 'image/jpeg' }
+app.post('/api/analyze-screenshot', async (req, res) => {
+  const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+  if (!ANTHROPIC_KEY) return res.status(503).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
+
+  const { image, mediaType = 'image/jpeg' } = req.body;
+  if (!image) return res.status(400).json({ error: 'image (base64) required' });
+
+  // Validate base64 size — reject if > 5MB decoded
+  const approxBytes = image.length * 0.75;
+  if (approxBytes > 5 * 1024 * 1024) {
+    return res.status(400).json({ error: 'Image too large. Please screenshot a smaller area or reduce image quality.' });
+  }
+
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-opus-4-6',
+        max_tokens: 1024,
+        messages: [{
+          role: 'user',
+          content: [
+            {
+              type: 'image',
+              source: { type: 'base64', media_type: mediaType, data: image }
+            },
+            {
+              type: 'text',
+              text: `This is a screenshot from an Indian stock broker app (Zerodha, Angel One, ICICI Direct, HDFC Securities, Upstox, 5paisa, Groww, or similar) showing trading positions or holdings.
+
+Extract ALL positions/holdings visible and return ONLY a valid JSON array. No explanation, no markdown, no backticks. Just the raw JSON array.
+
+Each position object must have exactly these fields:
+- symbol: stock or option symbol as shown (string)
+- qty: quantity as number (positive for BUY/long, negative for SELL/short)
+- avgPrice: average buy/cost price as number
+- ltp: last traded price if visible, else 0
+- pnl: profit and loss value if visible, else 0
+- type: "BUY" or "SELL"
+- product: "INTRADAY", "DELIVERY", "FUTURES", or "OPTIONS"
+
+If no positions are visible, return: []`
+            }
+          ]
+        }]
+      })
+    });
+
+    if (!response.ok) {
+      const err = await response.text();
+      return res.status(502).json({ error: 'Claude API error', detail: err.slice(0, 200) });
+    }
+
+    const data = await response.json();
+    const text = data.content?.[0]?.text || '[]';
+
+    // Clean and parse
+    const clean = text.replace(/```json|```/g, '').trim();
+    let positions;
+    try {
+      positions = JSON.parse(clean);
+      if (!Array.isArray(positions)) throw new Error('Not an array');
+    } catch(e) {
+      // Try to extract JSON array from response
+      const match = clean.match(/\[[\s\S]*\]/);
+      if (match) {
+        positions = JSON.parse(match[0]);
+      } else {
+        positions = [];
+      }
+    }
+
+    res.json({ positions, raw: text });
+  } catch(e) {
+    res.status(502).json({ error: 'Analysis failed: ' + e.message });
+  }
+});
+
 // ── Start ──────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n🚀 DeltaBuddy Backend on port ${PORT}`);

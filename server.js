@@ -168,6 +168,101 @@ app.get('/api/option-chain', async (req, res) => {
   }
 });
 
+// ── NSE LIVE QUOTES ───────────────────────────────────────────────────────────
+// Returns real-time prices, change, % change, prevClose for all NSE indices + stocks
+// Source: NSE allIndices + equity stock indices — same data as NSE website & brokers
+
+// Cache: 10 seconds (NSE updates every ~15s)
+let nseQuoteCache = null;
+let nseQuoteCacheTime = 0;
+const NSE_QUOTE_TTL = 10000;
+
+async function fetchNSEAllIndices() {
+  const cookies = await getNSECookies();
+  const r = await fetch('https://www.nseindia.com/api/allIndices', {
+    headers: { ...NSE_BASE_HEADERS, Cookie: cookies }, timeout: 12000
+  });
+  if (!r.ok) throw new Error(`allIndices ${r.status}`);
+  const d = await r.json();
+  return d.data || [];
+}
+
+async function fetchNSENifty50Stocks() {
+  const cookies = await getNSECookies();
+  const r = await fetch('https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050', {
+    headers: { ...NSE_BASE_HEADERS, Cookie: cookies }, timeout: 12000
+  });
+  if (!r.ok) throw new Error(`equity-stockIndices ${r.status}`);
+  const d = await r.json();
+  return d.data || [];
+}
+
+app.get('/api/nse-quotes', async (req, res) => {
+  try {
+    // Serve cache if fresh
+    if (nseQuoteCache && (Date.now() - nseQuoteCacheTime) < NSE_QUOTE_TTL) {
+      return res.json(nseQuoteCache);
+    }
+
+    // Fetch indices and Nifty50 stocks in parallel
+    const [indices, stocks] = await Promise.allSettled([
+      fetchNSEAllIndices(),
+      fetchNSENifty50Stocks(),
+    ]);
+
+    const result = {};
+
+    // Process indices
+    if (indices.status === 'fulfilled') {
+      indices.value.forEach(idx => {
+        const name = idx.index || idx.indexSymbol;
+        if (!name) return;
+        result[name] = {
+          price     : idx.last || idx.lastPrice || 0,
+          change    : idx.percentChange || idx.pChange || 0,
+          prevClose : idx.previousClose || idx.previousDay || 0,
+          netChange : idx.variation || idx.change || 0,
+          open      : idx.open || 0,
+          high      : idx.high || 0,
+          low       : idx.low || 0,
+          type      : 'index',
+        };
+      });
+    }
+
+    // Process Nifty50 stocks (skip META row which has index summary)
+    if (stocks.status === 'fulfilled') {
+      stocks.value.forEach(s => {
+        const sym = s.symbol;
+        if (!sym || sym === 'NIFTY 50') return;
+        result[sym] = {
+          price     : s.lastPrice || s.ltp || 0,
+          change    : s.pChange || s.percentChange || 0,
+          prevClose : s.previousClose || s.previousDay || 0,
+          netChange : s.change || 0,
+          open      : s.open || 0,
+          high      : s.dayHigh || s.high || 0,
+          low       : s.dayLow  || s.low  || 0,
+          type      : 'stock',
+        };
+      });
+    }
+
+    if (Object.keys(result).length === 0) throw new Error('No data from NSE');
+
+    nseQuoteCache     = result;
+    nseQuoteCacheTime = Date.now();
+    res.json(result);
+
+  } catch(e) {
+    // If cache exists (even stale), return it with warning
+    if (nseQuoteCache) {
+      return res.json({ ...nseQuoteCache, _stale: true, _error: e.message });
+    }
+    res.status(502).json({ error: 'NSE quotes failed', detail: e.message });
+  }
+});
+
 // ── GEX / GREEKS ANALYSIS ENDPOINT ────────────────────────────────────────────
 // Calculates Gamma Exposure (GEX), Delta Walls, Vanna, Charm from NSE OC data
 app.get('/api/gex', async (req, res) => {

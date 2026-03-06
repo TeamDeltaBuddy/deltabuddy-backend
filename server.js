@@ -175,7 +175,7 @@ app.get('/api/option-chain', async (req, res) => {
 // Cache: 10 seconds (NSE updates every ~15s)
 let nseQuoteCache = null;
 let nseQuoteCacheTime = 0;
-const NSE_QUOTE_TTL = 10000;
+const NSE_QUOTE_TTL = 5000;
 
 async function fetchNSEAllIndices() {
   const cookies = await getNSECookies();
@@ -506,8 +506,8 @@ app.get('/api/vix', async (req, res) => {
     const vix = data.price;
     const change = data.change;
     // Classify
-    const level = vix > 22 ? 'HIGH' : vix > 17 ? 'ELEVATED' : vix > 13 ? 'MODERATE' : 'LOW';
-    const color = vix > 22 ? 'red' : vix > 17 ? 'orange' : vix > 13 ? 'yellow' : 'green';
+    const level = vix > 24 ? 'HIGH' : vix > 20 ? 'ELEVATED' : vix > 14 ? 'MODERATE' : 'LOW';
+    const color = vix > 24 ? 'red' : vix > 20 ? 'orange' : vix > 14 ? 'yellow' : 'green';
     res.json({ vix, change, level, color });
   } catch(e) {
     res.status(502).json({ error: 'VIX fetch failed', detail: e.message });

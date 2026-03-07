@@ -1176,6 +1176,159 @@ app.get('/api/nse/fno-ban', async (req, res) => {
   }
 });
 
+// ── FII / DII DATA — NSE EOD ──────────────────────────────────────────────────
+// Cache: 30 minutes (NSE updates once per day after market close)
+let fiiDiiCache = null;
+let fiiDiiLastFetch = 0;
+const FII_DII_TTL = 30 * 60 * 1000;
+
+app.get('/api/nse/fii-dii', async (req, res) => {
+  try {
+    if (fiiDiiCache && (Date.now() - fiiDiiLastFetch) < FII_DII_TTL) {
+      return res.json(fiiDiiCache);
+    }
+    const cookies = await getNSECookies();
+
+    // NSE FII/DII cash market data — last 10 trading days
+    const url = 'https://www.nseindia.com/api/fiidiiTradeReact';
+    const r = await fetch(url, {
+      headers: { ...NSE_BASE_HEADERS, Cookie: cookies },
+      timeout: 12000,
+    });
+    if (!r.ok) throw new Error(`NSE FII/DII ${r.status}`);
+    const raw = await r.json();
+
+    // NSE returns array of daily records
+    // Each record: { date, fii_buy_value, fii_sell_value, fii_net_value, dii_buy_value, dii_sell_value, dii_net_value }
+    const data = (Array.isArray(raw) ? raw : raw.data || [])
+      .slice(0, 10)
+      .map(d => ({
+        date    : d.date || d.trading_date || d.Date || '',
+        fiiBuy  : parseFloat(d.fii_buy_value  || d.FII_BUY_VALUE  || d.fiiBuy  || 0),
+        fiiSell : parseFloat(d.fii_sell_value || d.FII_SELL_VALUE || d.fiiSell || 0),
+        fiiNet  : parseFloat(d.fii_net_value  || d.FII_NET_VALUE  || d.fiiNet  || 0),
+        diiBuy  : parseFloat(d.dii_buy_value  || d.DII_BUY_VALUE  || d.diiBuy  || 0),
+        diiSell : parseFloat(d.dii_sell_value || d.DII_SELL_VALUE || d.diiSell || 0),
+        diiNet  : parseFloat(d.dii_net_value  || d.DII_NET_VALUE  || d.diiNet  || 0),
+      }))
+      .filter(d => d.date);
+
+    // Latest day summary
+    const latest = data[0] || {};
+    const result = {
+      data,
+      latest: {
+        fii: { buy: latest.fiiBuy, sell: latest.fiiSell, net: latest.fiiNet },
+        dii: { buy: latest.diiBuy, sell: latest.diiSell, net: latest.diiNet },
+        date: latest.date,
+      },
+      source: 'NSE',
+      fetchedAt: new Date().toISOString(),
+    };
+
+    fiiDiiCache = result;
+    fiiDiiLastFetch = Date.now();
+    res.json(result);
+  } catch(e) {
+    // Return stale cache if available
+    if (fiiDiiCache) return res.json({ ...fiiDiiCache, stale: true });
+    res.status(502).json({ error: 'FII/DII fetch failed', detail: e.message });
+  }
+});
+
+// ── EVENTS / ECONOMIC CALENDAR — NSE ─────────────────────────────────────────
+let eventsCache = null;
+let eventsLastFetch = 0;
+const EVENTS_TTL = 60 * 60 * 1000; // 1 hour
+
+app.get('/api/nse/events', async (req, res) => {
+  try {
+    if (eventsCache && (Date.now() - eventsLastFetch) < EVENTS_TTL) {
+      return res.json(eventsCache);
+    }
+    const cookies = await getNSECookies();
+
+    // Fetch corporate events (results, dividends, AGM, bonus)
+    const eventsUrl = 'https://www.nseindia.com/api/event-calendar';
+    const r = await fetch(eventsUrl, {
+      headers: { ...NSE_BASE_HEADERS, Cookie: cookies },
+      timeout: 12000,
+    });
+    if (!r.ok) throw new Error(`NSE events ${r.status}`);
+    const raw = await r.json();
+
+    const today = new Date();
+    const nextMonth = new Date(today);
+    nextMonth.setDate(today.getDate() + 30);
+
+    const events = (Array.isArray(raw) ? raw : raw.data || [])
+      .map(e => ({
+        date    : e.date || e.Date || '',
+        company : e.symbol || e.companyName || e.company || '',
+        type    : (e.purpose || e.type || '').toLowerCase(),
+        title   : e.purpose || e.description || e.type || '',
+        impact  : ['results','dividend','board meeting','agm'].some(k =>
+                    (e.purpose||'').toLowerCase().includes(k)) ? 'high' : 'medium',
+      }))
+      .filter(e => {
+        if (!e.date) return false;
+        const d = new Date(e.date);
+        return d >= today && d <= nextMonth;
+      })
+      .sort((a, b) => new Date(a.date) - new Date(b.date))
+      .slice(0, 30);
+
+    eventsCache = { events, fetchedAt: new Date().toISOString(), source: 'NSE' };
+    eventsLastFetch = Date.now();
+    res.json(eventsCache);
+  } catch(e) {
+    if (eventsCache) return res.json({ ...eventsCache, stale: true });
+    res.status(502).json({ error: 'Events fetch failed', detail: e.message });
+  }
+});
+
+// ── BULK & BLOCK DEALS — NSE ──────────────────────────────────────────────────
+let bulkDealsCache = null;
+let bulkDealsLastFetch = 0;
+const BULK_DEALS_TTL = 30 * 60 * 1000; // 30 min
+
+app.get('/api/nse/bulk-deals', async (req, res) => {
+  try {
+    if (bulkDealsCache && (Date.now() - bulkDealsLastFetch) < BULK_DEALS_TTL) {
+      return res.json(bulkDealsCache);
+    }
+    const cookies = await getNSECookies();
+
+    const [bulkR, blockR] = await Promise.allSettled([
+      fetch('https://www.nseindia.com/api/bulkdeals', { headers: { ...NSE_BASE_HEADERS, Cookie: cookies }, timeout: 12000 }),
+      fetch('https://www.nseindia.com/api/blockdeals', { headers: { ...NSE_BASE_HEADERS, Cookie: cookies }, timeout: 12000 }),
+    ]);
+
+    const parseDeal = (raw, type) => (Array.isArray(raw) ? raw : raw?.data || [])
+      .slice(0, 20)
+      .map(d => ({
+        date    : d.BD_DT_DATE || d.BD_DATE || d.date || '',
+        stock   : d.BD_SYMBOL || d.symbol || '',
+        client  : d.BD_CLIENT_NAME || d.clientName || '',
+        type    : (d.BD_BUY_SELL || d.buyOrSell || '').toUpperCase(),
+        quantity: parseInt(d.BD_QTY_TRD || d.quantity || 0),
+        price   : parseFloat(d.BD_TP_WATP || d.price || 0),
+        value   : parseFloat(d.BD_TP_WATP || 0) * parseInt(d.BD_QTY_TRD || 0) / 1e7, // ₹ Cr
+        dealType: type,
+      }));
+
+    const bulkDeals  = bulkR.status === 'fulfilled' && bulkR.value.ok  ? parseDeal(await bulkR.value.json(),  'Bulk')  : [];
+    const blockDeals = blockR.status === 'fulfilled' && blockR.value.ok ? parseDeal(await blockR.value.json(), 'Block') : [];
+
+    bulkDealsCache = { bulkDeals, blockDeals, fetchedAt: new Date().toISOString(), source: 'NSE' };
+    bulkDealsLastFetch = Date.now();
+    res.json(bulkDealsCache);
+  } catch(e) {
+    if (bulkDealsCache) return res.json({ ...bulkDealsCache, stale: true });
+    res.status(502).json({ error: 'Bulk/Block deals fetch failed', detail: e.message });
+  }
+});
+
 // ── RAZORPAY SUBSCRIPTION ─────────────────────────────────────────────────────
 const crypto = require('crypto');
 

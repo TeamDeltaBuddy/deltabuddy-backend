@@ -273,14 +273,52 @@ app.get('/api/gex', async (req, res) => {
     : `https://www.nseindia.com/api/option-chain-equities?symbol=${symbol}`;
 
   try {
+    // Reuse the same robust fetch logic as /api/option-chain (with retry)
+    let raw;
     const cookies = await getNSECookies();
     const r = await fetch(apiUrl, { headers: { ...NSE_BASE_HEADERS, Cookie: cookies }, timeout: 15000 });
-    if (!r.ok) throw new Error(`NSE ${r.status}`);
-    const raw = await r.json();
+    if (!r.ok) {
+      if (r.status === 401 || r.status === 403) {
+        nseLastFetch = 0;
+        const fresh = await getNSECookies();
+        const retry = await fetch(apiUrl, { headers: { ...NSE_BASE_HEADERS, Cookie: fresh }, timeout: 15000 });
+        if (!retry.ok) throw new Error(`NSE ${retry.status} after retry`);
+        raw = await retry.json();
+      } else {
+        throw new Error(`NSE ${r.status}`);
+      }
+    } else {
+      raw = await r.json();
+    }
+
+    if (!raw?.records?.underlyingValue) {
+      throw new Error('NSE returned empty data — market may be closed');
+    }
 
     const spot      = raw.records?.underlyingValue || 0;
-    const lotSize   = symbol === 'BANKNIFTY' ? 15 : symbol === 'FINNIFTY' ? 40 : symbol === 'MIDCPNIFTY' ? 50 : 75;
-    const rows      = raw.filtered?.data || raw.records?.data || [];
+
+    // Extract lot size directly from NSE data — first row that has it
+    const allRows    = raw.records?.data || [];
+    const expiryDates = raw.records?.expiryDates || [];
+    const nearExpiry  = expiryDates[0] || '';
+    const rows        = nearExpiry
+      ? allRows.filter(r => r.expiryDate === nearExpiry)
+      : allRows.slice(0, 100);
+
+    // NSE provides marketLotSize on each option row — use it directly
+    let lotSize = 0;
+    for (const row of rows) {
+      const opt = row.CE || row.PE;
+      if (opt && opt.marketLot) { lotSize = opt.marketLot; break; }
+      if (opt && opt.totalTradedVolume && row.CE?.openInterest) {
+        // fallback — some NSE responses use different field names
+      }
+    }
+    // Last resort fallback with correct values as of Mar 2025
+    if (!lotSize) {
+      const fallback = { NIFTY:75, BANKNIFTY:30, FINNIFTY:60, MIDCPNIFTY:120 };
+      lotSize = fallback[symbol] || 75;
+    }
 
     // Black-Scholes helpers
     function erf(x) {
@@ -427,6 +465,9 @@ app.get('/api/gex', async (req, res) => {
       posWalls, negWalls, topCallOI, topPutOI,
       zoneLabel,
       regime: totalGEX > 0 ? 'positive' : 'negative',
+      nearExpiry,
+      rowCount: rows.length,
+      lotSizeSource: lotSize ? 'nse' : 'fallback',
       strikes: strikesArr.slice(
         Math.max(0, strikesArr.findIndex(s => s.strike >= spot * 0.97)),
         strikesArr.findIndex(s => s.strike >= spot * 1.03) + 1

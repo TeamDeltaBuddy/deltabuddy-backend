@@ -1296,82 +1296,93 @@ app.get('/api/nse/events', async (req, res) => {
       return res.json(eventsCache);
     }
     const cookies = await getNSECookies();
-
-    const r = await fetch('https://www.nseindia.com/api/event-calendar', {
-      headers: { ...NSE_BASE_HEADERS, Cookie: cookies },
-      timeout: 12000,
-    });
-    if (!r.ok) throw new Error(`NSE events ${r.status}`);
-    const raw = await r.json();
-
     const today = new Date(); today.setHours(0,0,0,0);
     const cutoff = new Date(today); cutoff.setDate(today.getDate() + 30);
 
-    const corporate = (Array.isArray(raw) ? raw : raw.data || [])
-      .filter(e => {
-        const sym = (e.symbol || '').toUpperCase();
-        if (!FNO_STOCKS.has(sym)) return false;           // only F&O stocks
-        const purpose = (e.purpose || '').toLowerCase();
-        // Only high-impact corporate events
-        return purpose.includes('result') ||
-               purpose.includes('dividend') ||
-               purpose.includes('bonus') ||
-               purpose.includes('split') ||
-               purpose.includes('buyback') ||
-               purpose.includes('board meeting');
-      })
-      .map(e => {
-        const purpose = (e.purpose || '').toLowerCase();
-        const type = purpose.includes('result') ? 'earnings'
-          : purpose.includes('dividend') ? 'dividend'
-          : purpose.includes('bonus') ? 'bonus'
-          : purpose.includes('split') ? 'split'
-          : purpose.includes('buyback') ? 'buyback'
-          : 'corporate';
-        return {
-          date    : e.date || '',
-          company : (e.symbol || '').toUpperCase(),
-          type,
-          title   : e.purpose || '',
-          category: 'corporate',
-          impact  : (type === 'earnings' || type === 'buyback') ? 'high' : 'medium',
-        };
-      })
-      .filter(e => {
-        if (!e.date) return false;
-        const d = new Date(e.date); d.setHours(0,0,0,0);
-        return d >= today && d <= cutoff;
-      })
-      .sort((a,b) => new Date(a.date) - new Date(b.date))
-      .slice(0, 40);
+    // ── 1. F&O corporate events from NSE ──────────────────────────────────
+    let corporate = [];
+    try {
+      const r = await fetch('https://www.nseindia.com/api/event-calendar', {
+        headers: { ...NSE_BASE_HEADERS, Cookie: cookies }, timeout: 12000,
+      });
+      if (r.ok) {
+        const raw = await r.json();
+        corporate = (Array.isArray(raw) ? raw : raw.data || [])
+          .filter(e => {
+            const sym = (e.symbol || '').toUpperCase();
+            if (!FNO_STOCKS.has(sym)) return false;
+            const p = (e.purpose || '').toLowerCase();
+            return p.includes('result') || p.includes('dividend') ||
+                   p.includes('bonus')  || p.includes('split') || p.includes('buyback');
+          })
+          .map(e => {
+            const p = (e.purpose || '').toLowerCase();
+            return {
+              date    : e.date || '',
+              company : (e.symbol || '').toUpperCase(),
+              type    : p.includes('result') ? 'earnings' : p.includes('dividend') ? 'dividend' : p.includes('bonus') ? 'bonus' : p.includes('split') ? 'split' : 'buyback',
+              title   : e.purpose || '',
+              category: 'corporate',
+              impact  : p.includes('result') ? 'high' : 'medium',
+            };
+          })
+          .filter(e => { if (!e.date) return false; const d = new Date(e.date); d.setHours(0,0,0,0); return d >= today && d <= cutoff; })
+          .sort((a,b) => new Date(a.date) - new Date(b.date))
+          .slice(0, 40);
+      }
+    } catch(e) { console.warn('[Events] NSE corporate fetch failed:', e.message); }
 
-    // Add auto-generated macro events (expiry dates, always useful)
-    const macro = [];
-    // Next 4 weekly expiries (every Thursday for NIFTY, last Thursday for others)
-    const addExpiries = () => {
-      const d = new Date(today);
-      let found = 0;
+    // ── 2. Auto-generate F&O expiry dates (weekly Thu) ─────────────────────
+    const expiries = [];
+    { const d = new Date(today); let found = 0;
       while (found < 6) {
         d.setDate(d.getDate() + 1);
-        if (d.getDay() === 4) { // Thursday
-          macro.push({
-            date    : d.toISOString().split('T')[0],
-            company : '',
-            type    : 'expiry',
-            title   : found % 4 === 3 ? 'Monthly F&O Expiry' : 'Weekly F&O Expiry (NIFTY)',
-            category: 'macro',
-            impact  : found % 4 === 3 ? 'high' : 'medium',
-          });
+        if (d.getDay() === 4) {
+          expiries.push({ date: d.toISOString().split('T')[0], company: '', type: 'expiry',
+            title: found % 4 === 3 ? 'Monthly F&O Expiry (All Indices)' : 'Weekly F&O Expiry (NIFTY)',
+            category: 'expiry', impact: found % 4 === 3 ? 'high' : 'medium' });
           found++;
         }
       }
-    };
-    addExpiries();
+    }
 
-    const events = [...macro, ...corporate]
+    // ── 3. Macro events — Investing.com economic calendar RSS ──────────────
+    const macro = [];
+    try {
+      const rssR = await fetch('https://www.investing.com/rss/news_301.rss', {
+        headers: { 'User-Agent': NSE_BASE_HEADERS['User-Agent'], 'Accept': 'application/rss+xml,*/*' },
+        timeout: 10000,
+      });
+      if (rssR.ok) {
+        const xml = await rssR.text();
+        const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)];
+        const MACRO_TERMS = ['repo rate','rbi policy','mpc meeting','fomc','fed rate','federal reserve',
+          'gdp','cpi','inflation data','wpi','iip','pmi','union budget','fiscal deficit',
+          'trade deficit','opec','nonfarm payroll','unemployment rate','interest rate','rate hike','rate cut'];
+        items.slice(0, 60).forEach(m => {
+          const title = (m[1].match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/) || m[1].match(/<title>(.*?)<\/title>/))?.[1] || '';
+          const pubDate = (m[1].match(/<pubDate>(.*?)<\/pubDate>/))?.[1] || '';
+          if (!title || !pubDate) return;
+          const tl = title.toLowerCase();
+          if (!MACRO_TERMS.some(t => tl.includes(t))) return;
+          const d = new Date(pubDate);
+          if (isNaN(d)) return;
+          d.setHours(0,0,0,0);
+          if (d < today || d > cutoff) return;
+          const type = tl.includes('repo') || tl.includes('mpc') || tl.includes('rbi') ? 'rbi'
+                     : tl.includes('fed') || tl.includes('fomc') ? 'fed'
+                     : tl.includes('gdp') ? 'gdp'
+                     : tl.includes('cpi') || tl.includes('inflation') ? 'inflation'
+                     : 'macro';
+          macro.push({ date: d.toISOString().split('T')[0], company: '', type, title, category: 'macro', impact: 'high' });
+        });
+      }
+    } catch(e) { console.warn('[Events] Macro RSS failed:', e.message); }
+
+    const events = [...expiries, ...macro, ...corporate]
       .sort((a,b) => new Date(a.date) - new Date(b.date));
 
-    eventsCache = { events, fetchedAt: new Date().toISOString(), source: 'NSE' };
+    eventsCache = { events, fetchedAt: new Date().toISOString(), source: 'NSE+RSS' };
     eventsLastFetch = Date.now();
     res.json(eventsCache);
   } catch(e) {
@@ -1379,6 +1390,7 @@ app.get('/api/nse/events', async (req, res) => {
     res.status(502).json({ error: 'Events fetch failed', detail: e.message });
   }
 });
+
 
 // ── BULK & BLOCK DEALS — NSE ──────────────────────────────────────────────────
 let bulkDealsCache = null;

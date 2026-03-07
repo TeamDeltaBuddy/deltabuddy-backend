@@ -311,6 +311,21 @@ app.get('/api/gex', async (req, res) => {
     }
 
     const now = new Date();
+
+    // NSE returns dates like "28-Nov-2024" — parse manually
+    const monthMap = {Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11};
+    function parseNSEDate(str) {
+      if (!str) return null;
+      const parts = str.split('-');
+      if (parts.length === 3) {
+        const d = parseInt(parts[0]);
+        const m = monthMap[parts[1]];
+        const y = parseInt(parts[2]);
+        if (!isNaN(d) && m !== undefined && !isNaN(y)) return new Date(y, m, d, 15, 30, 0);
+      }
+      const fallback = new Date(str);
+      return isNaN(fallback) ? null : fallback;
+    }
     const strikes = {};
 
     rows.forEach(row => {
@@ -320,8 +335,10 @@ app.get('/api/gex', async (req, res) => {
       ['CE','PE'].forEach(type => {
         const opt = row[type];
         if (!opt) return;
-        const expiry    = new Date(opt.expiryDate || row.expiryDate);
-        const T         = Math.max((expiry - now) / (1000*60*60*24*365), 0.001);
+        const expiryRaw  = opt.expiryDate || row.expiryDate;
+        const expiry     = parseNSEDate(expiryRaw);
+        if (!expiry) return;
+        const T          = Math.max((expiry - now) / (1000*60*60*24*365), 0.001);
         const iv        = (opt.impliedVolatility || opt.IV || 20) / 100;
         const oi        = opt.openInterest || 0;
         const oiChg     = opt.changeinOpenInterest || 0;

@@ -1236,7 +1236,56 @@ app.get('/api/nse/fii-dii', async (req, res) => {
   }
 });
 
-// ── EVENTS / ECONOMIC CALENDAR — NSE ─────────────────────────────────────────
+// ── F&O ELIGIBLE STOCKS (NSE current list) ───────────────────────────────────
+const FNO_STOCKS = new Set([
+  'RELIANCE','TCS','HDFCBANK','INFY','ICICIBANK','HINDUNILVR','SBIN','BHARTIARTL',
+  'KOTAKBANK','ITC','LT','HCLTECH','AXISBANK','ASIANPAINT','MARUTI','SUNPHARMA',
+  'TITAN','ULTRACEMCO','BAJFINANCE','WIPRO','NESTLEIND','POWERGRID','NTPC','ONGC',
+  'TECHM','BAJAJFINSV','GRASIM','ADANIENT','ADANIPORTS','TATAMOTORS','TATASTEEL',
+  'JSWSTEEL','HINDALCO','COALINDIA','DRREDDY','CIPLA','DIVISLAB','APOLLOHOSP',
+  'EICHERMOT','HEROMOTOCO','BAJAJ-AUTO','TATACONSUM','BRITANNIA','PIDILITIND',
+  'HAVELLS','VOLTAS','DABUR','MARICO','COLPAL','GODREJCP','BERGEPAINT','KANSAINER',
+  'INDIGO','TRENT','NYKAA','ZOMATO','PAYTM','POLICYBZR','DELHIVERY','IRCTC',
+  'LODHA','PRESTIGE','OBEROIRLTY','DLF','GODREJPROP','PHOENIXLTD',
+  'HDFCLIFE','SBILIFE','ICICIGI','LICI','MUTHOOTFIN','BAJAJHLDNG','CHOLAFIN',
+  'SHRIRAMFIN','M&MFIN','RECLTD','PFC','IRFC',
+  'M&M','TVSMOTOR','ASHOKLEY','MOTHERSON','BOSCHLTD','EXIDEIND','AMARAJABAT',
+  'SIEMENS','ABB','BHEL','BEL','HAL','COCHINSHIP','GRSE','MIDHANI',
+  'BPCL','IOC','HINDPETRO','GAIL','MGL','IGL','PETRONET',
+  'AUROPHARMA','BIOCON','LUPIN','TORNTPHARM','ALKEM','IPCALAB','GRANULES',
+  'INDHOTEL','LEMONTREE','CHALET',
+  'VBL','UNITDSPR','RADICO','UBL',
+  'BANKBARODA','PNB','CANBK','FEDERALBNK','IDFCFIRSTB','BANDHANBNK','RBLBANK',
+  'IDEA','MTNL',
+  'GMRINFRA','IRB','NHAI','CONCOR',
+  'SAIL','NMDC','NATIONALUM','VEDL','HINDZINC',
+  'UPL','PIIND','COROMANDEL','CHAMBLFERT','GNFC',
+  'MCDOWELL-N','PAGEIND','WHIRLPOOL','DIXON','AMBER','BLUESTARCO',
+  'ZYDUSLIFE','GLAXO','PFIZER','ABBOTINDIA','SANOFI',
+  'PERSISTENT','LTTS','COFORGE','MINDTREE','MPHASIS','LTIM','OFSS',
+  'SUNTV','ZEEL','PVRINOX','INOXWIND',
+  'ATGL','TORNTPOWER','ADANIGREEN','TATAPOWER','CESC','NHPC',
+  'DEEPAKNTR','AARTIIND','NAVINFLUOR',
+  'METROPOLIS','LALPATHLAB','MAXHEALTH','FORTIS',
+  'ASTRAL','SUPREMEIND','ATUL','FLUOROCHEM',
+  'ABCAPITAL','ANGELONE','BSE','CDSL','MCX','NAUKRI','JUSTDIAL','INDIAMART',
+]);
+
+// ── MACRO EVENT KEYWORDS ─────────────────────────────────────────────────────
+const MACRO_KEYWORDS = [
+  'repo rate','reverse repo','monetary policy','mpc','rbi policy',
+  'fed rate','fomc','federal reserve','us fed',
+  'gdp','gross domestic product',
+  'cpi','inflation','wpi','iip','pmi',
+  'union budget','interim budget','fiscal deficit',
+  'trade deficit','current account','balance of payment',
+  'crude oil','opec',
+  'election','exit poll','results',
+  'rbi governor','sebi circular','sebi board',
+  'us jobs','nonfarm payroll','unemployment',
+  'earnings season','f&o expiry','derivatives expiry',
+];
+
 let eventsCache = null;
 let eventsLastFetch = 0;
 const EVENTS_TTL = 60 * 60 * 1000; // 1 hour
@@ -1248,35 +1297,79 @@ app.get('/api/nse/events', async (req, res) => {
     }
     const cookies = await getNSECookies();
 
-    // Fetch corporate events (results, dividends, AGM, bonus)
-    const eventsUrl = 'https://www.nseindia.com/api/event-calendar';
-    const r = await fetch(eventsUrl, {
+    const r = await fetch('https://www.nseindia.com/api/event-calendar', {
       headers: { ...NSE_BASE_HEADERS, Cookie: cookies },
       timeout: 12000,
     });
     if (!r.ok) throw new Error(`NSE events ${r.status}`);
     const raw = await r.json();
 
-    const today = new Date();
-    const nextMonth = new Date(today);
-    nextMonth.setDate(today.getDate() + 30);
+    const today = new Date(); today.setHours(0,0,0,0);
+    const cutoff = new Date(today); cutoff.setDate(today.getDate() + 30);
 
-    const events = (Array.isArray(raw) ? raw : raw.data || [])
-      .map(e => ({
-        date    : e.date || e.Date || '',
-        company : e.symbol || e.companyName || e.company || '',
-        type    : (e.purpose || e.type || '').toLowerCase(),
-        title   : e.purpose || e.description || e.type || '',
-        impact  : ['results','dividend','board meeting','agm'].some(k =>
-                    (e.purpose||'').toLowerCase().includes(k)) ? 'high' : 'medium',
-      }))
+    const corporate = (Array.isArray(raw) ? raw : raw.data || [])
+      .filter(e => {
+        const sym = (e.symbol || '').toUpperCase();
+        if (!FNO_STOCKS.has(sym)) return false;           // only F&O stocks
+        const purpose = (e.purpose || '').toLowerCase();
+        // Only high-impact corporate events
+        return purpose.includes('result') ||
+               purpose.includes('dividend') ||
+               purpose.includes('bonus') ||
+               purpose.includes('split') ||
+               purpose.includes('buyback') ||
+               purpose.includes('board meeting');
+      })
+      .map(e => {
+        const purpose = (e.purpose || '').toLowerCase();
+        const type = purpose.includes('result') ? 'earnings'
+          : purpose.includes('dividend') ? 'dividend'
+          : purpose.includes('bonus') ? 'bonus'
+          : purpose.includes('split') ? 'split'
+          : purpose.includes('buyback') ? 'buyback'
+          : 'corporate';
+        return {
+          date    : e.date || '',
+          company : (e.symbol || '').toUpperCase(),
+          type,
+          title   : e.purpose || '',
+          category: 'corporate',
+          impact  : (type === 'earnings' || type === 'buyback') ? 'high' : 'medium',
+        };
+      })
       .filter(e => {
         if (!e.date) return false;
-        const d = new Date(e.date);
-        return d >= today && d <= nextMonth;
+        const d = new Date(e.date); d.setHours(0,0,0,0);
+        return d >= today && d <= cutoff;
       })
-      .sort((a, b) => new Date(a.date) - new Date(b.date))
-      .slice(0, 30);
+      .sort((a,b) => new Date(a.date) - new Date(b.date))
+      .slice(0, 40);
+
+    // Add auto-generated macro events (expiry dates, always useful)
+    const macro = [];
+    // Next 4 weekly expiries (every Thursday for NIFTY, last Thursday for others)
+    const addExpiries = () => {
+      const d = new Date(today);
+      let found = 0;
+      while (found < 6) {
+        d.setDate(d.getDate() + 1);
+        if (d.getDay() === 4) { // Thursday
+          macro.push({
+            date    : d.toISOString().split('T')[0],
+            company : '',
+            type    : 'expiry',
+            title   : found % 4 === 3 ? 'Monthly F&O Expiry' : 'Weekly F&O Expiry (NIFTY)',
+            category: 'macro',
+            impact  : found % 4 === 3 ? 'high' : 'medium',
+          });
+          found++;
+        }
+      }
+    };
+    addExpiries();
+
+    const events = [...macro, ...corporate]
+      .sort((a,b) => new Date(a.date) - new Date(b.date));
 
     eventsCache = { events, fetchedAt: new Date().toISOString(), source: 'NSE' };
     eventsLastFetch = Date.now();

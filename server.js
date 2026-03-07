@@ -1275,6 +1275,12 @@ let eventsCache = null;
 let eventsLastFetch = 0;
 const EVENTS_TTL = 60 * 60 * 1000; // 1 hour
 
+// RBI MPC dates 2025-26 — published by RBI at start of year, hardcoded for reliability
+const RBI_MPC_DATES = [
+  '2025-04-09','2025-06-06','2025-08-08','2025-10-08','2025-12-05',
+  '2026-02-07','2026-04-08','2026-06-05','2026-08-07','2026-10-07','2026-12-04',
+];
+
 app.get('/api/nse/events', async (req, res) => {
   try {
     if (eventsCache && (Date.now() - eventsLastFetch) < EVENTS_TTL) {
@@ -1282,9 +1288,79 @@ app.get('/api/nse/events', async (req, res) => {
     }
     const cookies = await getNSECookies();
     const today = new Date(); today.setHours(0,0,0,0);
-    const cutoff = new Date(today); cutoff.setDate(today.getDate() + 30);
+    const cutoff = new Date(today); cutoff.setDate(today.getDate() + 45);
 
-    // ── 1. F&O corporate events from NSE ──────────────────────────────────
+    // ── 1. Global macro — Forex Factory via JBlanked free API ─────────────
+    const macro = [];
+    try {
+      const today8 = today.toISOString().split('T')[0];
+      const cutoff8 = cutoff.toISOString().split('T')[0];
+      // Fetch USD high-impact (Fed, GDP, CPI, NFP, FOMC) + INR high-impact (RBI)
+      const [usdR, inrR] = await Promise.allSettled([
+        fetch(`https://www.jblanked.com/news/api/forex-factory/calendar/range/?from=${today8}&to=${cutoff8}&currency=USD&impact=High`, {
+          headers: { 'User-Agent': NSE_BASE_HEADERS['User-Agent'] }, timeout: 10000,
+        }),
+        fetch(`https://www.jblanked.com/news/api/forex-factory/calendar/range/?from=${today8}&to=${cutoff8}&currency=INR&impact=High`, {
+          headers: { 'User-Agent': NSE_BASE_HEADERS['User-Agent'] }, timeout: 10000,
+        }),
+      ]);
+
+      const parseFF = (r) => {
+        if (r.status !== 'fulfilled' || !r.value.ok) return [];
+        return r.value.json().then(data => {
+          return (Array.isArray(data) ? data : []).map(e => {
+            const tl = (e.name || e.title || '').toLowerCase();
+            const type = tl.includes('fed') || tl.includes('fomc') || tl.includes('interest rate') ? 'fed'
+                       : tl.includes('gdp') ? 'gdp'
+                       : tl.includes('cpi') || tl.includes('inflation') ? 'inflation'
+                       : tl.includes('nonfarm') || tl.includes('employment') ? 'jobs'
+                       : tl.includes('rbi') || tl.includes('repo') ? 'rbi'
+                       : 'macro';
+            return {
+              date    : (e.date || '').split('T')[0],
+              company : '',
+              type,
+              title   : e.name || e.title || '',
+              currency: e.currency || '',
+              forecast: e.forecast || '',
+              previous: e.previous || '',
+              category: 'macro',
+              impact  : 'high',
+            };
+          }).filter(e => e.date && e.title);
+        }).catch(() => []);
+      };
+
+      const [usdEvents, inrEvents] = await Promise.all([parseFF(usdR), parseFF(inrR)]);
+      macro.push(...usdEvents, ...inrEvents);
+    } catch(e) { console.warn('[Events] JBlanked fetch failed:', e.message); }
+
+    // ── 2. RBI MPC dates — hardcoded, always accurate ──────────────────────
+    RBI_MPC_DATES.forEach(date => {
+      const d = new Date(date); d.setHours(0,0,0,0);
+      if (d >= today && d <= cutoff) {
+        // Don't duplicate if JBlanked already returned it
+        if (!macro.find(e => e.date === date && e.type === 'rbi')) {
+          macro.push({ date, company:'', type:'rbi', title:'RBI MPC Policy Decision', category:'macro', impact:'high' });
+        }
+      }
+    });
+
+    // ── 3. F&O expiry dates — every Thursday ──────────────────────────────
+    const expiries = [];
+    { const d = new Date(today); let found = 0;
+      while (found < 8) {
+        d.setDate(d.getDate() + 1);
+        if (d.getDay() === 4) {
+          expiries.push({ date: d.toISOString().split('T')[0], company:'', type:'expiry',
+            title: found % 4 === 3 ? 'Monthly F&O Expiry (All Indices)' : 'Weekly F&O Expiry (NIFTY)',
+            category:'expiry', impact: found % 4 === 3 ? 'high' : 'medium' });
+          found++;
+        }
+      }
+    }
+
+    // ── 4. Nifty 50 heavyweight results from NSE ───────────────────────────
     let corporate = [];
     try {
       const r = await fetch('https://www.nseindia.com/api/event-calendar', {
@@ -1297,77 +1373,27 @@ app.get('/api/nse/events', async (req, res) => {
             const sym = (e.symbol || '').toUpperCase();
             if (!FNO_STOCKS.has(sym)) return false;
             const p = (e.purpose || '').toLowerCase();
-            return p.includes('result') || p.includes('dividend') ||
-                   p.includes('bonus')  || p.includes('split') || p.includes('buyback');
+            return p.includes('result');  // results only, not dividends/AGM
           })
-          .map(e => {
-            const p = (e.purpose || '').toLowerCase();
-            return {
-              date    : e.date || '',
-              company : (e.symbol || '').toUpperCase(),
-              type    : p.includes('result') ? 'earnings' : p.includes('dividend') ? 'dividend' : p.includes('bonus') ? 'bonus' : p.includes('split') ? 'split' : 'buyback',
-              title   : e.purpose || '',
-              category: 'corporate',
-              impact  : p.includes('result') ? 'high' : 'medium',
-            };
-          })
+          .map(e => ({
+            date    : e.date || '',
+            company : (e.symbol || '').toUpperCase(),
+            type    : 'earnings',
+            title   : e.purpose || 'Quarterly Results',
+            category: 'corporate',
+            impact  : 'high',
+          }))
           .filter(e => { if (!e.date) return false; const d = new Date(e.date); d.setHours(0,0,0,0); return d >= today && d <= cutoff; })
           .sort((a,b) => new Date(a.date) - new Date(b.date))
-          .slice(0, 40);
+          .slice(0, 30);
       }
     } catch(e) { console.warn('[Events] NSE corporate fetch failed:', e.message); }
 
-    // ── 2. Auto-generate F&O expiry dates (weekly Thu) ─────────────────────
-    const expiries = [];
-    { const d = new Date(today); let found = 0;
-      while (found < 6) {
-        d.setDate(d.getDate() + 1);
-        if (d.getDay() === 4) {
-          expiries.push({ date: d.toISOString().split('T')[0], company: '', type: 'expiry',
-            title: found % 4 === 3 ? 'Monthly F&O Expiry (All Indices)' : 'Weekly F&O Expiry (NIFTY)',
-            category: 'expiry', impact: found % 4 === 3 ? 'high' : 'medium' });
-          found++;
-        }
-      }
-    }
-
-    // ── 3. Macro events — Investing.com economic calendar RSS ──────────────
-    const macro = [];
-    try {
-      const rssR = await fetch('https://www.investing.com/rss/news_301.rss', {
-        headers: { 'User-Agent': NSE_BASE_HEADERS['User-Agent'], 'Accept': 'application/rss+xml,*/*' },
-        timeout: 10000,
-      });
-      if (rssR.ok) {
-        const xml = await rssR.text();
-        const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)];
-        const MACRO_TERMS = ['repo rate','rbi policy','mpc meeting','fomc','fed rate','federal reserve',
-          'gdp','cpi','inflation data','wpi','iip','pmi','union budget','fiscal deficit',
-          'trade deficit','opec','nonfarm payroll','unemployment rate','interest rate','rate hike','rate cut'];
-        items.slice(0, 60).forEach(m => {
-          const title = (m[1].match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/) || m[1].match(/<title>(.*?)<\/title>/))?.[1] || '';
-          const pubDate = (m[1].match(/<pubDate>(.*?)<\/pubDate>/))?.[1] || '';
-          if (!title || !pubDate) return;
-          const tl = title.toLowerCase();
-          if (!MACRO_TERMS.some(t => tl.includes(t))) return;
-          const d = new Date(pubDate);
-          if (isNaN(d)) return;
-          d.setHours(0,0,0,0);
-          if (d < today || d > cutoff) return;
-          const type = tl.includes('repo') || tl.includes('mpc') || tl.includes('rbi') ? 'rbi'
-                     : tl.includes('fed') || tl.includes('fomc') ? 'fed'
-                     : tl.includes('gdp') ? 'gdp'
-                     : tl.includes('cpi') || tl.includes('inflation') ? 'inflation'
-                     : 'macro';
-          macro.push({ date: d.toISOString().split('T')[0], company: '', type, title, category: 'macro', impact: 'high' });
-        });
-      }
-    } catch(e) { console.warn('[Events] Macro RSS failed:', e.message); }
-
     const events = [...expiries, ...macro, ...corporate]
+      .filter((e,i,arr) => arr.findIndex(x => x.date === e.date && x.title === e.title) === i) // dedupe
       .sort((a,b) => new Date(a.date) - new Date(b.date));
 
-    eventsCache = { events, fetchedAt: new Date().toISOString(), source: 'NSE+RSS' };
+    eventsCache = { events, fetchedAt: new Date().toISOString(), source: 'ForexFactory+RBI+NSE' };
     eventsLastFetch = Date.now();
     res.json(eventsCache);
   } catch(e) {
@@ -1375,7 +1401,6 @@ app.get('/api/nse/events', async (req, res) => {
     res.status(502).json({ error: 'Events fetch failed', detail: e.message });
   }
 });
-
 
 // ── BULK & BLOCK DEALS — NSE ──────────────────────────────────────────────────
 let bulkDealsCache = null;

@@ -1213,56 +1213,28 @@ app.get('/api/nse/fii-dii', async (req, res) => {
 
     // Log first record keys so we know exact NSE field names
     const arr = Array.isArray(raw) ? raw : raw.data || [];
-    if (arr[0]) console.log('[FII/DII] NSE keys:', Object.keys(arr[0]).join(', '));
 
+    // NSE returns 2 rows per date: one for DII, one for FII/FPI
+    // Fields: category, date, buyValue, sellValue, netValue (all strings with commas)
     const pf = v => parseFloat((v || '0').toString().replace(/,/g, '')) || 0;
-    const data = arr
-      .slice(0, 10)
-      .map(d => {
-        // NSE actual keys (as of 2025): date, buyValue, sellValue, netValue per category
-        // category field distinguishes FII vs DII
-        const isFII = (d.category||d.type||'').toUpperCase().includes('FII') || (d.name||'').toUpperCase().includes('FII');
-        const isDII = (d.category||d.type||'').toUpperCase().includes('DII') || (d.name||'').toUpperCase().includes('DII');
 
-        return {
-          date    : d.date || d.trading_date || d.Date || d.tradeDate || '',
-          category: d.category || d.type || d.name || '',
-          fiiBuy  : pf(d.fii_buy_value  || d.FII_BUY_VALUE  || (isFII ? d.buyValue  || d.buy_value  : 0)),
-          fiiSell : pf(d.fii_sell_value || d.FII_SELL_VALUE || (isFII ? d.sellValue || d.sell_value : 0)),
-          fiiNet  : pf(d.fii_net_value  || d.FII_NET_VALUE  || (isFII ? d.netValue  || d.net_value  : 0)),
-          diiBuy  : pf(d.dii_buy_value  || d.DII_BUY_VALUE  || (isDII ? d.buyValue  || d.buy_value  : 0)),
-          diiSell : pf(d.dii_sell_value || d.DII_SELL_VALUE || (isDII ? d.sellValue || d.sell_value : 0)),
-          diiNet  : pf(d.dii_net_value  || d.DII_NET_VALUE  || (isDII ? d.netValue  || d.net_value  : 0)),
-          _raw    : d, // keep raw for debugging
-        };
-      })
-      .filter(d => d.date);
-
-    // NSE fiidiiTradeReact may return separate FII + DII rows per day — merge them
     const merged = {};
-    data.forEach(d => {
+    arr.forEach(d => {
       const key = d.date;
       if (!merged[key]) merged[key] = { date: d.date, fiiBuy:0, fiiSell:0, fiiNet:0, diiBuy:0, diiSell:0, diiNet:0 };
-      const cat = (d.category||'').toUpperCase();
+      const cat = (d.category || '').toUpperCase();
       if (cat.includes('FII') || cat.includes('FPI')) {
-        const raw0 = d._raw;
-        merged[key].fiiBuy  = pf(raw0.buyValue || raw0.buy_value || raw0.fii_buy_value || raw0.BUY_VALUE || d.fiiBuy);
-        merged[key].fiiSell = pf(raw0.sellValue|| raw0.sell_value|| raw0.fii_sell_value|| raw0.SELL_VALUE|| d.fiiSell);
-        merged[key].fiiNet  = pf(raw0.netValue || raw0.net_value || raw0.fii_net_value || raw0.NET_VALUE || d.fiiNet);
+        merged[key].fiiBuy  = pf(d.buyValue);
+        merged[key].fiiSell = pf(d.sellValue);
+        merged[key].fiiNet  = pf(d.netValue);
       } else if (cat.includes('DII')) {
-        const raw0 = d._raw;
-        merged[key].diiBuy  = pf(raw0.buyValue || raw0.buy_value || raw0.dii_buy_value || raw0.BUY_VALUE || d.diiBuy);
-        merged[key].diiSell = pf(raw0.sellValue|| raw0.sell_value|| raw0.dii_sell_value|| raw0.SELL_VALUE|| d.diiSell);
-        merged[key].diiNet  = pf(raw0.netValue || raw0.net_value || raw0.dii_net_value || raw0.NET_VALUE || d.diiNet);
-      } else {
-        // Single row with both — just copy all fields
-        Object.assign(merged[key], { fiiBuy:d.fiiBuy, fiiSell:d.fiiSell, fiiNet:d.fiiNet,
-          diiBuy:d.diiBuy, diiSell:d.diiSell, diiNet:d.diiNet });
+        merged[key].diiBuy  = pf(d.buyValue);
+        merged[key].diiSell = pf(d.sellValue);
+        merged[key].diiNet  = pf(d.netValue);
       }
     });
-    const finalData = Object.values(merged).sort((a,b) => new Date(b.date)-new Date(a.date));
-    // also expose raw first record for debugging
-    const rawKeys = arr[0] ? { sampleKeys: Object.keys(arr[0]), sampleRow: arr[0] } : {};
+    const finalData = Object.values(merged).sort((a,b) => new Date(b.date) - new Date(a.date));
+
 
     // Latest day summary
     const latest = finalData[0] || {};
@@ -1275,7 +1247,6 @@ app.get('/api/nse/fii-dii', async (req, res) => {
       },
       source: 'NSE',
       fetchedAt: new Date().toISOString(),
-      ...rawKeys,
     };
 
     fiiDiiCache = result;

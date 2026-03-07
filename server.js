@@ -1290,57 +1290,61 @@ app.get('/api/nse/events', async (req, res) => {
     const cutoff = new Date(today); cutoff.setDate(today.getDate() + 45);
     const cookies = await getNSECookies();
 
-    // ── 1. Tradays economic calendar — free, no key, structured JSON ──────
+    // ── 1. Forex Factory XML feed — free, no key, reliable ───────────────
     const macro = [];
     try {
-      const from = today.toISOString().split('T')[0];
-      const to   = cutoff.toISOString().split('T')[0];
-      const url  = `https://tradays.com/en/economic-calendar/widget?json=1&from=${from}&to=${to}`;
-      const r = await fetch(url, {
-        headers: { 'User-Agent': NSE_BASE_HEADERS['User-Agent'], 'Accept': 'application/json' },
-        timeout: 12000,
-      });
-      if (r.ok) {
-        const data = await r.json();
-        const items = Array.isArray(data) ? data : (data.data || data.items || []);
-        items.forEach(e => {
-          const impact = parseInt(e.importance || e.impact || 0);
-          if (impact < 2) return; // only medium (2) and high (3) impact
-          const currency = (e.currency || '').toUpperCase();
-          if (!['USD','INR','EUR','GBP'].includes(currency)) return; // relevant currencies only
-          const title = e.name || e.title || e.event || '';
-          if (!title) return;
-          const date = (e.date || e.datetime || '').split('T')[0];
-          if (!date) return;
-          const d = new Date(date); d.setHours(0,0,0,0);
-          if (d < today || d > cutoff) return;
-
-          const tl = title.toLowerCase();
-          const type = tl.includes('fed') || tl.includes('fomc') || tl.includes('federal reserve') ? 'fed'
-                     : tl.includes('gdp') ? 'gdp'
-                     : tl.includes('cpi') || tl.includes('inflation') ? 'inflation'
-                     : tl.includes('nonfarm') || tl.includes('employment') ? 'jobs'
-                     : tl.includes('pmi') ? 'pmi'
-                     : tl.includes('rbi') || tl.includes('repo') || tl.includes('monetary policy') ? 'rbi'
-                     : tl.includes('interest rate') ? 'rate'
-                     : 'macro';
-
-          macro.push({
-            date,
-            company  : '',
-            type,
-            title    : title.trim(),
-            currency,
-            forecast : e.forecast || '',
-            previous : e.previous || '',
-            category : 'macro',
-            impact   : impact >= 3 ? 'high' : 'medium',
+      // FF publishes this week + next week XML — fetch both
+      const FF_URLS = [
+        'https://nfs.faireconomy.media/ff_calendar_thisweek.xml',
+        'https://nfs.faireconomy.media/ff_calendar_nextweek.xml',
+      ];
+      for (const url of FF_URLS) {
+        try {
+          const r = await fetch(url, {
+            headers: { 'User-Agent': NSE_BASE_HEADERS['User-Agent'], 'Accept': 'application/xml,*/*' },
+            timeout: 10000,
           });
-        });
+          if (!r.ok) continue;
+          const xml = await r.text();
+          const events = [...xml.matchAll(/<event>([\s\S]*?)<\/event>/g)];
+          events.forEach(m => {
+            const body = m[1];
+            const get = (tag) => (body.match(new RegExp(`<${tag}><!\[CDATA\[([\s\S]*?)\]\]><\/${tag}>`))||body.match(new RegExp(`<${tag}>(.*?)<\/${tag}>`))||[])[1]||'';
+            const impact = get('impact').toLowerCase();
+            if (impact !== 'high' && impact !== 'medium') return;
+            const currency = get('currency').toUpperCase();
+            if (!['USD','INR','EUR','GBP'].includes(currency)) return;
+            const title = get('title').trim();
+            if (!title) return;
+            const dateStr = get('date'); // format: MMM DD, YYYY
+            if (!dateStr) return;
+            const d = new Date(dateStr); d.setHours(0,0,0,0);
+            if (isNaN(d) || d < today || d > cutoff) return;
+            const tl = title.toLowerCase();
+            const type = tl.includes('fed') || tl.includes('fomc') || tl.includes('interest rate') ? 'fed'
+                       : tl.includes('gdp') ? 'gdp'
+                       : tl.includes('cpi') || tl.includes('inflation') ? 'inflation'
+                       : tl.includes('nonfarm') || tl.includes('employment') ? 'jobs'
+                       : tl.includes('pmi') ? 'pmi'
+                       : tl.includes('rbi') || tl.includes('repo') ? 'rbi'
+                       : 'macro';
+            macro.push({
+              date    : d.toISOString().split('T')[0],
+              company : '',
+              type,
+              title,
+              currency,
+              forecast: get('forecast'),
+              previous: get('previous'),
+              category: 'macro',
+              impact  : impact === 'high' ? 'high' : 'medium',
+            });
+          });
+        } catch(e) { console.warn('[Events] FF feed error:', url, e.message); }
       }
-    } catch(e) { console.warn('[Events] Tradays fetch failed:', e.message); }
+    } catch(e) { console.warn('[Events] FF fetch failed:', e.message); }
 
-    // ── 2. RBI MPC — hardcoded fallback (always accurate) ────────────────
+    // ── 2. RBI MPC — hardcoded, always accurate ───────────────────────────
     RBI_MPC_DATES.forEach(date => {
       const d = new Date(date); d.setHours(0,0,0,0);
       if (d < today || d > cutoff) return;
@@ -1377,25 +1381,15 @@ app.get('/api/nse/events', async (req, res) => {
       if (r.ok) {
         const raw = await r.json();
         corporate = (Array.isArray(raw) ? raw : raw.data || [])
-          .filter(e => {
-            const sym = (e.symbol || '').toUpperCase();
-            if (!FNO_STOCKS.has(sym)) return false;
-            return (e.purpose || '').toLowerCase().includes('result');
-          })
+          .filter(e => FNO_STOCKS.has((e.symbol||'').toUpperCase()) && (e.purpose||'').toLowerCase().includes('result'))
           .map(e => ({
             date    : e.date || '',
-            company : (e.symbol || '').toUpperCase(),
+            company : (e.symbol||'').toUpperCase(),
             type    : 'earnings',
             title   : e.purpose || 'Quarterly Results',
-            currency: 'INR',
-            category: 'corporate',
-            impact  : 'high',
+            currency: 'INR', category: 'corporate', impact: 'high',
           }))
-          .filter(e => {
-            if (!e.date) return false;
-            const d = new Date(e.date); d.setHours(0,0,0,0);
-            return d >= today && d <= cutoff;
-          })
+          .filter(e => { if (!e.date) return false; const d = new Date(e.date); d.setHours(0,0,0,0); return d >= today && d <= cutoff; })
           .sort((a,b) => new Date(a.date) - new Date(b.date))
           .slice(0, 30);
       }
@@ -1405,7 +1399,7 @@ app.get('/api/nse/events', async (req, res) => {
       .filter((e,i,arr) => arr.findIndex(x => x.date===e.date && x.title===e.title) === i)
       .sort((a,b) => new Date(a.date) - new Date(b.date));
 
-    eventsCache = { events, fetchedAt: new Date().toISOString(), source: 'Tradays+RBI+NSE', total: events.length };
+    eventsCache = { events, fetchedAt: new Date().toISOString(), source: 'ForexFactory+RBI+NSE', total: events.length };
     eventsLastFetch = Date.now();
     res.json(eventsCache);
   } catch(e) {

@@ -1294,6 +1294,10 @@ const MACRO_KEYWORDS = [
   'earnings season','f&o expiry','derivatives expiry',
 ];
 
+let eventsCache = null;
+let eventsLastFetch = 0;
+const EVENTS_TTL = 60 * 60 * 1000; // 1 hour
+
 // ── HARDCODED 2026 MACRO CALENDAR ────────────────────────────────────────────
 // Sources: Fed/FOMC fomc.gov, RBI rbi.org.in, US BLS, US BEA — dates fixed months ahead
 const MACRO_2026 = [

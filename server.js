@@ -1182,6 +1182,19 @@ let fiiDiiCache = null;
 let fiiDiiLastFetch = 0;
 const FII_DII_TTL = 30 * 60 * 1000;
 
+// Debug — returns raw NSE FII/DII response so we can see exact field names
+app.get('/api/nse/fii-dii/raw', async (req, res) => {
+  try {
+    const cookies = await getNSECookies();
+    const r = await fetch('https://www.nseindia.com/api/fiidiiTradeReact', {
+      headers: { ...NSE_BASE_HEADERS, Cookie: cookies },
+    });
+    const raw = await r.json();
+    const arr = Array.isArray(raw) ? raw : raw.data || [];
+    res.json({ status: r.status, isArray: Array.isArray(raw), totalRows: arr.length, first3: arr.slice(0,3), keys: arr[0] ? Object.keys(arr[0]) : [] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/nse/fii-dii', async (req, res) => {
   try {
     if (fiiDiiCache && (Date.now() - fiiDiiLastFetch) < FII_DII_TTL) {
@@ -1198,25 +1211,63 @@ app.get('/api/nse/fii-dii', async (req, res) => {
     if (!r.ok) throw new Error(`NSE FII/DII ${r.status}`);
     const raw = await r.json();
 
-    // NSE returns array of daily records
-    // Each record: { date, fii_buy_value, fii_sell_value, fii_net_value, dii_buy_value, dii_sell_value, dii_net_value }
-    const data = (Array.isArray(raw) ? raw : raw.data || [])
+    // Log first record keys so we know exact NSE field names
+    const arr = Array.isArray(raw) ? raw : raw.data || [];
+    if (arr[0]) console.log('[FII/DII] NSE keys:', Object.keys(arr[0]).join(', '));
+
+    const pf = v => parseFloat((v || '0').toString().replace(/,/g, '')) || 0;
+    const data = arr
       .slice(0, 10)
-      .map(d => ({
-        date    : d.date || d.trading_date || d.Date || '',
-        fiiBuy  : parseFloat(d.fii_buy_value  || d.FII_BUY_VALUE  || d.fiiBuy  || 0),
-        fiiSell : parseFloat(d.fii_sell_value || d.FII_SELL_VALUE || d.fiiSell || 0),
-        fiiNet  : parseFloat(d.fii_net_value  || d.FII_NET_VALUE  || d.fiiNet  || 0),
-        diiBuy  : parseFloat(d.dii_buy_value  || d.DII_BUY_VALUE  || d.diiBuy  || 0),
-        diiSell : parseFloat(d.dii_sell_value || d.DII_SELL_VALUE || d.diiSell || 0),
-        diiNet  : parseFloat(d.dii_net_value  || d.DII_NET_VALUE  || d.diiNet  || 0),
-      }))
+      .map(d => {
+        // NSE actual keys (as of 2025): date, buyValue, sellValue, netValue per category
+        // category field distinguishes FII vs DII
+        const isFII = (d.category||d.type||'').toUpperCase().includes('FII') || (d.name||'').toUpperCase().includes('FII');
+        const isDII = (d.category||d.type||'').toUpperCase().includes('DII') || (d.name||'').toUpperCase().includes('DII');
+
+        return {
+          date    : d.date || d.trading_date || d.Date || d.tradeDate || '',
+          category: d.category || d.type || d.name || '',
+          fiiBuy  : pf(d.fii_buy_value  || d.FII_BUY_VALUE  || (isFII ? d.buyValue  || d.buy_value  : 0)),
+          fiiSell : pf(d.fii_sell_value || d.FII_SELL_VALUE || (isFII ? d.sellValue || d.sell_value : 0)),
+          fiiNet  : pf(d.fii_net_value  || d.FII_NET_VALUE  || (isFII ? d.netValue  || d.net_value  : 0)),
+          diiBuy  : pf(d.dii_buy_value  || d.DII_BUY_VALUE  || (isDII ? d.buyValue  || d.buy_value  : 0)),
+          diiSell : pf(d.dii_sell_value || d.DII_SELL_VALUE || (isDII ? d.sellValue || d.sell_value : 0)),
+          diiNet  : pf(d.dii_net_value  || d.DII_NET_VALUE  || (isDII ? d.netValue  || d.net_value  : 0)),
+          _raw    : d, // keep raw for debugging
+        };
+      })
       .filter(d => d.date);
 
+    // NSE fiidiiTradeReact may return separate FII + DII rows per day — merge them
+    const merged = {};
+    data.forEach(d => {
+      const key = d.date;
+      if (!merged[key]) merged[key] = { date: d.date, fiiBuy:0, fiiSell:0, fiiNet:0, diiBuy:0, diiSell:0, diiNet:0 };
+      const cat = (d.category||'').toUpperCase();
+      if (cat.includes('FII') || cat.includes('FPI')) {
+        const raw0 = d._raw;
+        merged[key].fiiBuy  = pf(raw0.buyValue || raw0.buy_value || raw0.fii_buy_value || raw0.BUY_VALUE || d.fiiBuy);
+        merged[key].fiiSell = pf(raw0.sellValue|| raw0.sell_value|| raw0.fii_sell_value|| raw0.SELL_VALUE|| d.fiiSell);
+        merged[key].fiiNet  = pf(raw0.netValue || raw0.net_value || raw0.fii_net_value || raw0.NET_VALUE || d.fiiNet);
+      } else if (cat.includes('DII')) {
+        const raw0 = d._raw;
+        merged[key].diiBuy  = pf(raw0.buyValue || raw0.buy_value || raw0.dii_buy_value || raw0.BUY_VALUE || d.diiBuy);
+        merged[key].diiSell = pf(raw0.sellValue|| raw0.sell_value|| raw0.dii_sell_value|| raw0.SELL_VALUE|| d.diiSell);
+        merged[key].diiNet  = pf(raw0.netValue || raw0.net_value || raw0.dii_net_value || raw0.NET_VALUE || d.diiNet);
+      } else {
+        // Single row with both — just copy all fields
+        Object.assign(merged[key], { fiiBuy:d.fiiBuy, fiiSell:d.fiiSell, fiiNet:d.fiiNet,
+          diiBuy:d.diiBuy, diiSell:d.diiSell, diiNet:d.diiNet });
+      }
+    });
+    const finalData = Object.values(merged).sort((a,b) => new Date(b.date)-new Date(a.date));
+    // also expose raw first record for debugging
+    const rawKeys = arr[0] ? { sampleKeys: Object.keys(arr[0]), sampleRow: arr[0] } : {};
+
     // Latest day summary
-    const latest = data[0] || {};
+    const latest = finalData[0] || {};
     const result = {
-      data,
+      data: finalData,
       latest: {
         fii: { buy: latest.fiiBuy, sell: latest.fiiSell, net: latest.fiiNet },
         dii: { buy: latest.diiBuy, sell: latest.diiSell, net: latest.diiNet },
@@ -1224,6 +1275,7 @@ app.get('/api/nse/fii-dii', async (req, res) => {
       },
       source: 'NSE',
       fetchedAt: new Date().toISOString(),
+      ...rawKeys,
     };
 
     fiiDiiCache = result;
@@ -1271,14 +1323,64 @@ const MACRO_KEYWORDS = [
   'earnings season','f&o expiry','derivatives expiry',
 ];
 
-let eventsCache = null;
-let eventsLastFetch = 0;
-const EVENTS_TTL = 60 * 60 * 1000; // 1 hour
-
-// RBI MPC dates 2025-26 — hardcoded from RBI official calendar
-const RBI_MPC_DATES = [
-  '2025-04-09','2025-06-06','2025-08-08','2025-10-08','2025-12-05',
-  '2026-02-07','2026-04-08','2026-06-05','2026-08-07','2026-10-07','2026-12-04',
+// ── HARDCODED 2026 MACRO CALENDAR ────────────────────────────────────────────
+// Sources: Fed/FOMC fomc.gov, RBI rbi.org.in, US BLS, US BEA — dates fixed months ahead
+const MACRO_2026 = [
+  // FOMC meetings
+  { date:'2026-01-29', type:'fed',      title:'FOMC Rate Decision',                currency:'USD', impact:'high' },
+  { date:'2026-03-19', type:'fed',      title:'FOMC Rate Decision',                currency:'USD', impact:'high' },
+  { date:'2026-05-07', type:'fed',      title:'FOMC Rate Decision',                currency:'USD', impact:'high' },
+  { date:'2026-06-18', type:'fed',      title:'FOMC Rate Decision',                currency:'USD', impact:'high' },
+  { date:'2026-07-30', type:'fed',      title:'FOMC Rate Decision',                currency:'USD', impact:'high' },
+  { date:'2026-09-17', type:'fed',      title:'FOMC Rate Decision',                currency:'USD', impact:'high' },
+  { date:'2026-11-05', type:'fed',      title:'FOMC Rate Decision',                currency:'USD', impact:'high' },
+  { date:'2026-12-16', type:'fed',      title:'FOMC Rate Decision',                currency:'USD', impact:'high' },
+  // RBI MPC
+  { date:'2026-04-08', type:'rbi',      title:'RBI MPC Policy Decision',           currency:'INR', impact:'high' },
+  { date:'2026-06-05', type:'rbi',      title:'RBI MPC Policy Decision',           currency:'INR', impact:'high' },
+  { date:'2026-08-07', type:'rbi',      title:'RBI MPC Policy Decision',           currency:'INR', impact:'high' },
+  { date:'2026-10-07', type:'rbi',      title:'RBI MPC Policy Decision',           currency:'INR', impact:'high' },
+  { date:'2026-12-04', type:'rbi',      title:'RBI MPC Policy Decision',           currency:'INR', impact:'high' },
+  // US CPI (approx 2nd Wed each month)
+  { date:'2026-01-14', type:'inflation',title:'US CPI Inflation',                  currency:'USD', impact:'high' },
+  { date:'2026-02-11', type:'inflation',title:'US CPI Inflation',                  currency:'USD', impact:'high' },
+  { date:'2026-03-11', type:'inflation',title:'US CPI Inflation',                  currency:'USD', impact:'high' },
+  { date:'2026-04-15', type:'inflation',title:'US CPI Inflation',                  currency:'USD', impact:'high' },
+  { date:'2026-05-13', type:'inflation',title:'US CPI Inflation',                  currency:'USD', impact:'high' },
+  { date:'2026-06-10', type:'inflation',title:'US CPI Inflation',                  currency:'USD', impact:'high' },
+  { date:'2026-07-15', type:'inflation',title:'US CPI Inflation',                  currency:'USD', impact:'high' },
+  { date:'2026-08-12', type:'inflation',title:'US CPI Inflation',                  currency:'USD', impact:'high' },
+  { date:'2026-09-09', type:'inflation',title:'US CPI Inflation',                  currency:'USD', impact:'high' },
+  { date:'2026-10-14', type:'inflation',title:'US CPI Inflation',                  currency:'USD', impact:'high' },
+  { date:'2026-11-11', type:'inflation',title:'US CPI Inflation',                  currency:'USD', impact:'high' },
+  { date:'2026-12-09', type:'inflation',title:'US CPI Inflation',                  currency:'USD', impact:'high' },
+  // US NFP (1st Fri each month)
+  { date:'2026-01-09', type:'jobs',     title:'US Non-Farm Payrolls',              currency:'USD', impact:'high' },
+  { date:'2026-02-06', type:'jobs',     title:'US Non-Farm Payrolls',              currency:'USD', impact:'high' },
+  { date:'2026-03-06', type:'jobs',     title:'US Non-Farm Payrolls',              currency:'USD', impact:'high' },
+  { date:'2026-04-03', type:'jobs',     title:'US Non-Farm Payrolls',              currency:'USD', impact:'high' },
+  { date:'2026-05-01', type:'jobs',     title:'US Non-Farm Payrolls',              currency:'USD', impact:'high' },
+  { date:'2026-06-05', type:'jobs',     title:'US Non-Farm Payrolls',              currency:'USD', impact:'high' },
+  { date:'2026-07-02', type:'jobs',     title:'US Non-Farm Payrolls',              currency:'USD', impact:'high' },
+  { date:'2026-08-07', type:'jobs',     title:'US Non-Farm Payrolls',              currency:'USD', impact:'high' },
+  { date:'2026-09-04', type:'jobs',     title:'US Non-Farm Payrolls',              currency:'USD', impact:'high' },
+  { date:'2026-10-02', type:'jobs',     title:'US Non-Farm Payrolls',              currency:'USD', impact:'high' },
+  { date:'2026-11-06', type:'jobs',     title:'US Non-Farm Payrolls',              currency:'USD', impact:'high' },
+  { date:'2026-12-04', type:'jobs',     title:'US Non-Farm Payrolls',              currency:'USD', impact:'high' },
+  // US GDP Advance (last Thu of Jan/Apr/Jul/Oct)
+  { date:'2026-01-29', type:'gdp',      title:'US GDP Advance Estimate',           currency:'USD', impact:'high' },
+  { date:'2026-04-30', type:'gdp',      title:'US GDP Advance Estimate',           currency:'USD', impact:'high' },
+  { date:'2026-07-30', type:'gdp',      title:'US GDP Advance Estimate',           currency:'USD', impact:'high' },
+  { date:'2026-10-29', type:'gdp',      title:'US GDP Advance Estimate',           currency:'USD', impact:'high' },
+  // India CPI (approx 12th each month)
+  { date:'2026-01-13', type:'inflation',title:'India CPI Inflation',               currency:'INR', impact:'medium' },
+  { date:'2026-02-12', type:'inflation',title:'India CPI Inflation',               currency:'INR', impact:'medium' },
+  { date:'2026-03-13', type:'inflation',title:'India CPI Inflation',               currency:'INR', impact:'medium' },
+  { date:'2026-04-14', type:'inflation',title:'India CPI Inflation',               currency:'INR', impact:'medium' },
+  { date:'2026-05-13', type:'inflation',title:'India CPI Inflation',               currency:'INR', impact:'medium' },
+  { date:'2026-06-12', type:'inflation',title:'India CPI Inflation',               currency:'INR', impact:'medium' },
+  // Union Budget
+  { date:'2026-02-01', type:'macro',    title:'India Union Budget 2026-27',        currency:'INR', impact:'high' },
 ];
 
 app.get('/api/nse/events', async (req, res) => {
@@ -1287,126 +1389,66 @@ app.get('/api/nse/events', async (req, res) => {
       return res.json(eventsCache);
     }
     const today = new Date(); today.setHours(0,0,0,0);
-    const cutoff = new Date(today); cutoff.setDate(today.getDate() + 45);
-    const cookies = await getNSECookies();
+    const cutoff = new Date(today); cutoff.setDate(today.getDate() + 60);
 
-    // ── 1. Forex Factory XML feed — free, no key, reliable ───────────────
-    const macro = [];
-    try {
-      // FF publishes this week + next week XML — fetch both
-      const FF_URLS = [
-        'https://nfs.faireconomy.media/ff_calendar_thisweek.xml',
-        'https://nfs.faireconomy.media/ff_calendar_nextweek.xml',
-      ];
-      for (const url of FF_URLS) {
-        try {
-          const r = await fetch(url, {
-            headers: { 'User-Agent': NSE_BASE_HEADERS['User-Agent'], 'Accept': 'application/xml,*/*' },
-            timeout: 10000,
-          });
-          if (!r.ok) continue;
-          const xml = await r.text();
-          const events = [...xml.matchAll(/<event>([\s\S]*?)<\/event>/g)];
-          events.forEach(m => {
-            const body = m[1];
-            const get = (tag) => (body.match(new RegExp(`<${tag}><!\[CDATA\[([\s\S]*?)\]\]><\/${tag}>`))||body.match(new RegExp(`<${tag}>(.*?)<\/${tag}>`))||[])[1]||'';
-            const impact = get('impact').toLowerCase();
-            if (impact !== 'high' && impact !== 'medium') return;
-            const currency = get('currency').toUpperCase();
-            if (!['USD','INR','EUR','GBP'].includes(currency)) return;
-            const title = get('title').trim();
-            if (!title) return;
-            const dateStr = get('date'); // format: MMM DD, YYYY
-            if (!dateStr) return;
-            const d = new Date(dateStr); d.setHours(0,0,0,0);
-            if (isNaN(d) || d < today || d > cutoff) return;
-            const tl = title.toLowerCase();
-            const type = tl.includes('fed') || tl.includes('fomc') || tl.includes('interest rate') ? 'fed'
-                       : tl.includes('gdp') ? 'gdp'
-                       : tl.includes('cpi') || tl.includes('inflation') ? 'inflation'
-                       : tl.includes('nonfarm') || tl.includes('employment') ? 'jobs'
-                       : tl.includes('pmi') ? 'pmi'
-                       : tl.includes('rbi') || tl.includes('repo') ? 'rbi'
-                       : 'macro';
-            macro.push({
-              date    : d.toISOString().split('T')[0],
-              company : '',
-              type,
-              title,
-              currency,
-              forecast: get('forecast'),
-              previous: get('previous'),
-              category: 'macro',
-              impact  : impact === 'high' ? 'high' : 'medium',
-            });
-          });
-        } catch(e) { console.warn('[Events] FF feed error:', url, e.message); }
-      }
-    } catch(e) { console.warn('[Events] FF fetch failed:', e.message); }
+    // 1. Hardcoded macro calendar filtered to next 60 days
+    const macro = MACRO_2026
+      .filter(e => { const d = new Date(e.date); return d >= today && d <= cutoff; })
+      .map(e => ({ ...e, company:'', forecast:'', previous:'', category:'macro' }));
 
-    // ── 2. RBI MPC — hardcoded, always accurate ───────────────────────────
-    RBI_MPC_DATES.forEach(date => {
-      const d = new Date(date); d.setHours(0,0,0,0);
-      if (d < today || d > cutoff) return;
-      if (!macro.find(e => e.date === date && e.type === 'rbi')) {
-        macro.push({ date, company:'', type:'rbi', title:'RBI MPC Policy Decision',
-          currency:'INR', forecast:'', previous:'', category:'macro', impact:'high' });
-      }
-    });
-
-    // ── 3. F&O expiry dates — every Thursday ─────────────────────────────
+    // 2. F&O expiry — every Thursday, 8 weeks ahead
     const expiries = [];
-    { const d = new Date(today); let found = 0;
-      while (found < 8) {
+    { const d = new Date(today); let count = 0;
+      while (count < 8) {
         d.setDate(d.getDate() + 1);
         if (d.getDay() === 4) {
           expiries.push({
-            date    : d.toISOString().split('T')[0],
-            company : '', type: 'expiry',
-            title   : found % 4 === 3 ? 'Monthly F&O Expiry (All Indices)' : 'Weekly F&O Expiry (NIFTY)',
-            currency: 'INR', category: 'expiry',
-            impact  : found % 4 === 3 ? 'high' : 'medium',
+            date: d.toISOString().split('T')[0], company:'', category:'expiry',
+            type: count % 4 === 3 ? 'expiry_monthly' : 'expiry',
+            title: count % 4 === 3 ? 'Monthly F&O Expiry (All Indices)' : 'Weekly F&O Expiry (NIFTY)',
+            currency:'INR', forecast:'', previous:'',
+            impact: count % 4 === 3 ? 'high' : 'medium',
           });
-          found++;
+          count++;
         }
       }
     }
 
-    // ── 4. Nifty 50 heavyweight results from NSE ──────────────────────────
+    // 3. NSE corporate results (Nifty 50 heavyweights)
     let corporate = [];
     try {
+      const cookies = await getNSECookies();
+      const ctrl = new AbortController(); setTimeout(()=>ctrl.abort(), 10000);
       const r = await fetch('https://www.nseindia.com/api/event-calendar', {
-        headers: { ...NSE_BASE_HEADERS, Cookie: cookies }, timeout: 12000,
+        headers: { ...NSE_BASE_HEADERS, Cookie: cookies }, signal: ctrl.signal,
       });
       if (r.ok) {
         const raw = await r.json();
         corporate = (Array.isArray(raw) ? raw : raw.data || [])
           .filter(e => FNO_STOCKS.has((e.symbol||'').toUpperCase()) && (e.purpose||'').toLowerCase().includes('result'))
           .map(e => ({
-            date    : e.date || '',
-            company : (e.symbol||'').toUpperCase(),
-            type    : 'earnings',
-            title   : e.purpose || 'Quarterly Results',
-            currency: 'INR', category: 'corporate', impact: 'high',
+            date: e.date||'', company:(e.symbol||'').toUpperCase(),
+            type:'earnings', title:e.purpose||'Quarterly Results',
+            currency:'INR', forecast:'', previous:'', category:'corporate', impact:'high',
           }))
-          .filter(e => { if (!e.date) return false; const d = new Date(e.date); d.setHours(0,0,0,0); return d >= today && d <= cutoff; })
-          .sort((a,b) => new Date(a.date) - new Date(b.date))
+          .filter(e => { if (!e.date) return false; const d = new Date(e.date); return d >= today && d <= cutoff; })
           .slice(0, 30);
       }
-    } catch(e) { console.warn('[Events] NSE corporate failed:', e.message); }
+    } catch(e) { console.warn('[Events] NSE corporate:', e.message); }
 
     const events = [...expiries, ...macro, ...corporate]
       .filter((e,i,arr) => arr.findIndex(x => x.date===e.date && x.title===e.title) === i)
       .sort((a,b) => new Date(a.date) - new Date(b.date));
 
-    eventsCache = { events, fetchedAt: new Date().toISOString(), source: 'ForexFactory+RBI+NSE', total: events.length };
+    eventsCache = { events, fetchedAt:new Date().toISOString(), source:'Hardcoded+NSE', total:events.length };
     eventsLastFetch = Date.now();
     res.json(eventsCache);
   } catch(e) {
-    if (eventsCache) return res.json({ ...eventsCache, stale: true });
-    res.status(502).json({ error: 'Events fetch failed', detail: e.message });
+    if (eventsCache) return res.json({ ...eventsCache, stale:true });
+    res.status(502).json({ error:'Events failed', detail:e.message });
   }
 });
+
 // ── BULK & BLOCK DEALS — NSE ──────────────────────────────────────────────────
 let bulkDealsCache = null;
 let bulkDealsLastFetch = 0;

@@ -1597,15 +1597,11 @@ app.get('/api/health', (req, res) => {
 app.get('/api/expiry-tools', async (req, res) => {
   const symbol = (req.query.symbol || 'NIFTY').toUpperCase();
   try {
-    // Fetch NSE option chain
+    // Use same cookie-based fetch as other NSE endpoints
+    const cookies = await getNSECookies();
     const nseUrl = `https://www.nseindia.com/api/option-chain-indices?symbol=${symbol}`;
     const r = await fetch(nseUrl, {
-      headers: {
-        'User-Agent'  : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept'      : 'application/json',
-        'Referer'     : 'https://www.nseindia.com/option-chain',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
+      headers: { ...NSE_BASE_HEADERS, Cookie: cookies },
     });
     if (!r.ok) throw new Error(`NSE returned ${r.status}`);
     const json = await r.json();

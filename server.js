@@ -473,10 +473,11 @@ app.get('/api/gex', async (req, res) => {
       nearExpiry,
       rowCount: rows.length,
       lotSizeSource: lotSize ? 'nse' : 'fallback',
-      strikes: strikesArr.slice(
-        Math.max(0, strikesArr.findIndex(s => s.strike >= spot * 0.97)),
-        strikesArr.findIndex(s => s.strike >= spot * 1.03) + 1
-      ),
+      strikes: (() => {
+        const lo = strikesArr.findIndex(s => s.strike >= spot * 0.96);
+        const hi = strikesArr.findIndex(s => s.strike >= spot * 1.04);
+        return strikesArr.slice(lo === -1 ? 0 : lo, hi === -1 ? strikesArr.length : hi + 1);
+      })(),
     });
   } catch(e) {
     res.status(502).json({ error: 'GEX calculation failed', detail: e.message });

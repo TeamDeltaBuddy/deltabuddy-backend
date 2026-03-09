@@ -291,14 +291,19 @@ app.get('/api/gex', async (req, res) => {
       raw = await r.json();
     }
 
-    if (!raw?.records?.underlyingValue) {
-      throw new Error('NSE returned empty data — market may be closed');
+    const allDataRows = raw?.records?.data || [];
+    if (!allDataRows.length) {
+      throw new Error('NSE returned empty option chain data');
+    }
+    // underlyingValue may be 0 during pre-open; estimate from ATM strikes
+    let spot = raw.records?.underlyingValue || 0;
+    if (!spot) {
+      const ltps = allDataRows.flatMap(r => [r.CE?.underlyingValue, r.PE?.underlyingValue, r.CE?.lastPrice ? r.strikePrice : null]).filter(Boolean);
+      spot = ltps.length ? ltps[0] : (allDataRows[Math.floor(allDataRows.length/2)]?.strikePrice || 24500);
     }
 
-    const spot      = raw.records?.underlyingValue || 0;
-
     // Extract lot size directly from NSE data — first row that has it
-    const allRows    = raw.records?.data || [];
+    const allRows    = allDataRows;
     const expiryDates = raw.records?.expiryDates || [];
     const nearExpiry  = expiryDates[0] || '';
     const rows        = nearExpiry

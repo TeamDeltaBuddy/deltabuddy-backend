@@ -212,12 +212,10 @@ app.get('/api/nse-quotes', async (req, res) => {
 
     const result = {};
 
-    // Process indices
+    // Process indices — store by BOTH idx.index and idx.indexSymbol to cover all NSE variants
     if (indices.status === 'fulfilled') {
       indices.value.forEach(idx => {
-        const name = idx.index || idx.indexSymbol;
-        if (!name) return;
-        result[name] = {
+        const data = {
           price     : idx.last || idx.lastPrice || 0,
           change    : idx.percentChange || idx.pChange || 0,
           prevClose : idx.previousClose || idx.previousDay || 0,
@@ -227,6 +225,11 @@ app.get('/api/nse-quotes', async (req, res) => {
           low       : idx.low || 0,
           type      : 'index',
         };
+        if (!data.price) return;
+        // Store by every name variant NSE might use
+        [idx.index, idx.indexSymbol, idx.name].forEach(name => {
+          if (name) result[name] = data;
+        });
       });
     }
 
@@ -261,6 +264,19 @@ app.get('/api/nse-quotes', async (req, res) => {
     }
     res.status(502).json({ error: 'NSE quotes failed', detail: e.message });
   }
+});
+
+// Debug: see raw NSE index names (remove after confirming)
+app.get('/api/debug-indices', async (req, res) => {
+  try {
+    const cookies = await getNSECookies();
+    const r = await fetch('https://www.nseindia.com/api/allIndices', {
+      headers: { ...NSE_BASE_HEADERS, Cookie: cookies }, timeout: 12000
+    });
+    const d = await r.json();
+    const names = (d.data || []).map(i => ({ index: i.index, indexSymbol: i.indexSymbol, last: i.last }));
+    res.json(names);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── GEX / GREEKS ANALYSIS ENDPOINT ────────────────────────────────────────────

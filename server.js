@@ -187,6 +187,40 @@ function dhanToNSEFormat(dhanData, expiry, underlying) {
   };
 }
 
+// DEBUG: See raw Dhan response to fix field mapping
+app.get('/api/dhan/oc-debug', async (req, res) => {
+  const symbol = (req.query.symbol || 'NIFTY').toUpperCase();
+  const scrip  = DHAN_OC_SCRIPS[symbol];
+  if (!scrip) return res.status(400).json({ error: 'Unknown symbol' });
+  try {
+    // Step 1: expiry list
+    const expiryRes = await dhanAPI('/v2/optionchain/expirylist', 'POST', {
+      UnderlyingScrip: scrip.scrip,
+      UnderlyingSeg:   scrip.seg,
+    });
+    const expiries = expiryRes?.data || expiryRes?.expiryList || [];
+    if (!expiries.length) return res.json({ step: 'expiry', raw: expiryRes });
+
+    // Step 2: first expiry option chain
+    const ocRes = await dhanAPI('/v2/optionchain', 'POST', {
+      UnderlyingScrip: scrip.scrip,
+      UnderlyingSeg:   scrip.seg,
+      Expiry:          expiries[0],
+    });
+
+    // Return raw so we can see exact field names
+    return res.json({
+      expiries,
+      firstExpiry: expiries[0],
+      ocKeys: Object.keys(ocRes || {}),
+      ocRaw: JSON.stringify(ocRes).slice(0, 2000),
+      firstRow: (ocRes?.data || ocRes?.oc_data || [])[0] || 'no rows found',
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message, stack: e.stack?.slice(0,500) });
+  }
+});
+
 app.get('/api/dhan/option-chain', async (req, res) => {
   const symbol = (req.query.symbol || 'NIFTY').toUpperCase();
   const scrip  = DHAN_OC_SCRIPS[symbol];

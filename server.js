@@ -187,63 +187,67 @@ const OC_TTL  = 60 * 1000;
 
 const INDEX_SYMBOLS = ['NIFTY','BANKNIFTY','FINNIFTY','MIDCPNIFTY','NIFTYIT'];
 
+// Cloudflare Worker URL — set this after deploying the Worker
+// Format: https://nse-proxy.YOUR_SUBDOMAIN.workers.dev
+const CF_WORKER_URL = process.env.CF_WORKER_URL || '';
+
 app.get('/api/option-chain', async (req, res) => {
-  const symbol  = (req.query.symbol || 'NIFTY').toUpperCase();
+  const symbol = (req.query.symbol || 'NIFTY').toUpperCase();
+
+  // Serve from cache if fresh
+  if (ocCache[symbol] && (Date.now() - ocCache[symbol].ts) < OC_TTL) {
+    console.log(`[OC] Cache hit: ${symbol}`);
+    return res.json(ocCache[symbol].data);
+  }
+
+  // --- Tier 1: Cloudflare Worker (not blocked by NSE) ---
+  if (CF_WORKER_URL) {
+    try {
+      console.log(`[OC] Trying Cloudflare Worker for ${symbol}...`);
+      const r = await fetch(`${CF_WORKER_URL}/option-chain?symbol=${symbol}`, { timeout: 15000 });
+      if (r.ok) {
+        const data = await r.json();
+        if (!data?.error && data?.records?.data?.length > 0) {
+          ocCache[symbol] = { data, ts: Date.now() };
+          console.log(`[OC] Worker success: ${symbol}, ${data.records.data.length} rows`);
+          return res.json(data);
+        }
+      }
+      console.warn(`[OC] Worker returned no data for ${symbol}`);
+    } catch(e) {
+      console.warn(`[OC] Worker failed: ${e.message}`);
+    }
+  }
+
+  // --- Tier 2: Direct NSE (may be blocked on cloud, but try anyway) ---
   const isIndex = INDEX_SYMBOLS.includes(symbol);
   const apiUrl  = isIndex
     ? `https://www.nseindia.com/api/option-chain-indices?symbol=${symbol}`
     : `https://www.nseindia.com/api/option-chain-equities?symbol=${symbol}`;
 
-  // Serve from cache if fresh
-  const cacheKey = symbol;
-  if (ocCache[cacheKey] && (Date.now() - ocCache[cacheKey].ts) < OC_TTL) {
-    console.log(`[OC] Serving ${symbol} from cache`);
-    return res.json(ocCache[cacheKey].data);
-  }
-
-  // Try up to 3 times with cookie refresh on failure
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const forceRefresh = attempt > 1;
-      const cookies = await getNSECookies(forceRefresh);
-      if (!cookies) throw new Error('No cookies obtained');
-
-      const response = await fetch(apiUrl, {
-        headers: { ...NSE_BASE_HEADERS, Cookie: cookies },
-        timeout: 15000,
-      });
-
-      if (!response.ok) {
-        console.warn(`[OC] Attempt ${attempt}: NSE returned ${response.status}`);
-        if (attempt < 3) { nseLastFetch = 0; continue; }
-        throw new Error(`NSE ${response.status} after ${attempt} attempts`);
-      }
-
-      const data = await response.json();
-      if (!data?.records?.data?.length) {
-        console.warn(`[OC] Attempt ${attempt}: empty records`);
-        if (attempt < 3) continue;
-        throw new Error('NSE returned empty option chain');
-      }
-
-      // Cache and return
-      ocCache[cacheKey] = { data, ts: Date.now() };
-      console.log(`[OC] ${symbol} fetched OK, ${data.records.data.length} rows`);
+      const cookies = await getNSECookies(attempt > 1);
+      const r = await fetch(apiUrl, { headers: { ...NSE_BASE_HEADERS, Cookie: cookies }, timeout: 15000 });
+      if (!r.ok) throw new Error(`NSE ${r.status}`);
+      const data = await r.json();
+      if (!data?.records?.data?.length) throw new Error('Empty records');
+      ocCache[symbol] = { data, ts: Date.now() };
+      console.log(`[OC] NSE direct success: ${symbol}`);
       return res.json(data);
-
     } catch(e) {
-      console.error(`[OC] Attempt ${attempt} error:`, e.message);
-      if (attempt === 3) {
-        // Return stale cache if available rather than error
-        if (ocCache[cacheKey]) {
-          console.log(`[OC] Returning stale cache for ${symbol}`);
-          return res.json({ ...ocCache[cacheKey].data, _stale: true });
-        }
-        return res.status(502).json({ error: 'NSE fetch failed', detail: e.message });
-      }
-      await new Promise(r => setTimeout(r, 1000 * attempt)); // wait before retry
+      console.warn(`[OC] NSE attempt ${attempt}: ${e.message}`);
+      if (attempt < 2) await new Promise(r => setTimeout(r, 1500));
     }
   }
+
+  // Return stale cache if we have it
+  if (ocCache[symbol]) {
+    console.log(`[OC] Returning stale cache for ${symbol}`);
+    return res.json({ ...ocCache[symbol].data, _stale: true });
+  }
+
+  res.status(502).json({ error: 'NSE fetch failed', detail: 'Both Cloudflare Worker and direct NSE failed' });
 });
 
 // ── NSE LIVE QUOTES ───────────────────────────────────────────────────────────

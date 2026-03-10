@@ -118,28 +118,72 @@ app.delete('/api/dhan/order/:orderId', async (req, res) => {
 
 // ── NSE Cookie Management ─────────────────────────────────────────────────────
 let nseCookies = '', nseLastFetch = 0;
-const NSE_COOKIE_TTL = 4 * 60 * 1000;
+const NSE_COOKIE_TTL = 8 * 60 * 1000; // 8 min cache
+
 const NSE_BASE_HEADERS = {
-  'User-Agent'     : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+  'User-Agent'     : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   'Accept'         : 'application/json, text/plain, */*',
-  'Accept-Language': 'en-US,en;q=0.9',
+  'Accept-Language': 'en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7',
+  'Accept-Encoding': 'gzip, deflate, br',
   'Referer'        : 'https://www.nseindia.com/option-chain',
   'X-Requested-With': 'XMLHttpRequest',
+  'sec-ch-ua'      : '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Windows"',
+  'sec-fetch-dest' : 'empty',
+  'sec-fetch-mode' : 'cors',
+  'sec-fetch-site' : 'same-origin',
+  'Connection'     : 'keep-alive',
 };
 
-async function getNSECookies() {
-  if (nseCookies && (Date.now() - nseLastFetch) < NSE_COOKIE_TTL) return nseCookies;
+// NSE requires a 2-step cookie warm-up:
+// Step 1: hit homepage → get initial cookies
+// Step 2: hit /option-chain page → get additional session cookies
+// Only then does the API accept requests
+async function getNSECookies(forceRefresh = false) {
+  if (!forceRefresh && nseCookies && (Date.now() - nseLastFetch) < NSE_COOKIE_TTL) {
+    return nseCookies;
+  }
   try {
-    const res = await fetch('https://www.nseindia.com', {
-      headers: { 'User-Agent': NSE_BASE_HEADERS['User-Agent'], 'Accept': 'text/html,*/*' },
-      timeout: 10000,
+    const ua = NSE_BASE_HEADERS['User-Agent'];
+    const htmlHeaders = {
+      'User-Agent'     : ua,
+      'Accept'         : 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-IN,en-GB;q=0.9,en;q=0.8',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Connection'     : 'keep-alive',
+      'Upgrade-Insecure-Requests': '1',
+    };
+
+    // Step 1: homepage
+    const home = await fetch('https://www.nseindia.com', { headers: htmlHeaders, timeout: 12000 });
+    const homeCookies = (home.headers.raw()['set-cookie'] || []).map(c => c.split(';')[0]);
+
+    // Step 2: option-chain page with homepage cookies
+    const oc = await fetch('https://www.nseindia.com/option-chain', {
+      headers: { ...htmlHeaders, Cookie: homeCookies.join('; ') },
+      timeout: 12000,
     });
-    const raw = res.headers.raw()['set-cookie'] || [];
-    nseCookies   = raw.map(c => c.split(';')[0]).join('; ');
+    const ocCookies = (oc.headers.raw()['set-cookie'] || []).map(c => c.split(';')[0]);
+
+    // Merge — ocCookies override homeCookies on key conflicts
+    const cookieMap = {};
+    [...homeCookies, ...ocCookies].forEach(c => {
+      const [k] = c.split('=');
+      cookieMap[k.trim()] = c;
+    });
+    nseCookies   = Object.values(cookieMap).join('; ');
     nseLastFetch = Date.now();
-  } catch(e) { console.error('[NSE] Cookie fail:', e.message); }
+    console.log('[NSE] Cookies refreshed, keys:', Object.keys(cookieMap).join(','));
+  } catch(e) {
+    console.error('[NSE] Cookie warm-up failed:', e.message);
+  }
   return nseCookies;
 }
+
+// Option chain response cache — 60 seconds
+const ocCache = {};
+const OC_TTL  = 60 * 1000;
 
 const INDEX_SYMBOLS = ['NIFTY','BANKNIFTY','FINNIFTY','MIDCPNIFTY','NIFTYIT'];
 
@@ -149,22 +193,56 @@ app.get('/api/option-chain', async (req, res) => {
   const apiUrl  = isIndex
     ? `https://www.nseindia.com/api/option-chain-indices?symbol=${symbol}`
     : `https://www.nseindia.com/api/option-chain-equities?symbol=${symbol}`;
-  try {
-    const cookies = await getNSECookies();
-    const response = await fetch(apiUrl, { headers: { ...NSE_BASE_HEADERS, Cookie: cookies }, timeout: 15000 });
-    if (!response.ok) {
-      if (response.status === 401 || response.status === 403) {
-        nseLastFetch = 0;
-        const fresh = await getNSECookies();
-        const retry = await fetch(apiUrl, { headers: { ...NSE_BASE_HEADERS, Cookie: fresh }, timeout: 15000 });
-        if (!retry.ok) throw new Error(`NSE ${retry.status} after retry`);
-        return res.json(await retry.json());
+
+  // Serve from cache if fresh
+  const cacheKey = symbol;
+  if (ocCache[cacheKey] && (Date.now() - ocCache[cacheKey].ts) < OC_TTL) {
+    console.log(`[OC] Serving ${symbol} from cache`);
+    return res.json(ocCache[cacheKey].data);
+  }
+
+  // Try up to 3 times with cookie refresh on failure
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const forceRefresh = attempt > 1;
+      const cookies = await getNSECookies(forceRefresh);
+      if (!cookies) throw new Error('No cookies obtained');
+
+      const response = await fetch(apiUrl, {
+        headers: { ...NSE_BASE_HEADERS, Cookie: cookies },
+        timeout: 15000,
+      });
+
+      if (!response.ok) {
+        console.warn(`[OC] Attempt ${attempt}: NSE returned ${response.status}`);
+        if (attempt < 3) { nseLastFetch = 0; continue; }
+        throw new Error(`NSE ${response.status} after ${attempt} attempts`);
       }
-      throw new Error(`NSE ${response.status}`);
+
+      const data = await response.json();
+      if (!data?.records?.data?.length) {
+        console.warn(`[OC] Attempt ${attempt}: empty records`);
+        if (attempt < 3) continue;
+        throw new Error('NSE returned empty option chain');
+      }
+
+      // Cache and return
+      ocCache[cacheKey] = { data, ts: Date.now() };
+      console.log(`[OC] ${symbol} fetched OK, ${data.records.data.length} rows`);
+      return res.json(data);
+
+    } catch(e) {
+      console.error(`[OC] Attempt ${attempt} error:`, e.message);
+      if (attempt === 3) {
+        // Return stale cache if available rather than error
+        if (ocCache[cacheKey]) {
+          console.log(`[OC] Returning stale cache for ${symbol}`);
+          return res.json({ ...ocCache[cacheKey].data, _stale: true });
+        }
+        return res.status(502).json({ error: 'NSE fetch failed', detail: e.message });
+      }
+      await new Promise(r => setTimeout(r, 1000 * attempt)); // wait before retry
     }
-    res.json(await response.json());
-  } catch(e) {
-    res.status(502).json({ error: 'NSE fetch failed', detail: e.message });
   }
 });
 

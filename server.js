@@ -655,6 +655,138 @@ app.get('/api/yahoo/quote/:symbol', async (req, res) => {
   res.json({ ...data, symbol: req.params.symbol });
 });
 
+// ── Yahoo Finance Option Chain (fallback when NSE is blocked) ────────────────
+// Yahoo symbols: NIFTY=^NSEI, BANKNIFTY=^NSEBANK, FINNIFTY=^NSEFIN
+const YAHOO_OC_SYMBOLS = {
+  NIFTY:      '^NSEI',
+  BANKNIFTY:  '^NSEBANK',
+  FINNIFTY:   '^NSEFIN',
+  MIDCPNIFTY: '^CNXMIDCAP',
+};
+
+// Cache 60s
+const yahooOcCache = {};
+const YAHOO_OC_TTL = 60 * 1000;
+
+async function fetchYahooOptionChain(symbol, date) {
+  const yahooSym = YAHOO_OC_SYMBOLS[symbol] || '^NSEI';
+  const url = date
+    ? `https://query2.finance.yahoo.com/v7/finance/options/${encodeURIComponent(yahooSym)}?date=${date}`
+    : `https://query2.finance.yahoo.com/v7/finance/options/${encodeURIComponent(yahooSym)}`;
+  const r = await fetch(url, { headers: YAHOO_HEADERS, timeout: 15000 });
+  if (!r.ok) throw new Error(`Yahoo options ${r.status}`);
+  return r.json();
+}
+
+// Convert Yahoo option chain format → NSE-compatible format
+// so the frontend parseChainForExpiry() works unchanged
+function yahooToNSEFormat(yahooData) {
+  const result = yahooData?.optionChain?.result?.[0];
+  if (!result) throw new Error('No Yahoo option chain result');
+
+  const spot       = result.quote?.regularMarketPrice || 0;
+  const expiryTs   = result.expirationDates || [];
+  const allOptions = result.options || [];
+
+  // Convert Unix timestamps to NSE date format "DD-Mon-YYYY"
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  function tsToNSEDate(ts) {
+    const d = new Date(ts * 1000);
+    return `${String(d.getUTCDate()).padStart(2,'0')}-${months[d.getUTCMonth()]}-${d.getUTCFullYear()}`;
+  }
+
+  const expiryDates = expiryTs.map(tsToNSEDate);
+
+  // Build NSE-style records.data rows
+  const rows = [];
+  allOptions.forEach((optGroup, idx) => {
+    const expiryDate = tsToNSEDate(expiryTs[idx] || expiryTs[0]);
+    const calls = optGroup.calls || [];
+    const puts  = optGroup.puts  || [];
+
+    // Map by strike
+    const strikeMap = {};
+    calls.forEach(c => {
+      const K = c.strike;
+      if (!strikeMap[K]) strikeMap[K] = { strikePrice: K, expiryDate };
+      strikeMap[K].CE = {
+        lastPrice:             c.lastPrice        || 0,
+        impliedVolatility:     (c.impliedVolatility || 0) * 100,
+        openInterest:          c.openInterest      || 0,
+        changeinOpenInterest:  c.openInterest      || 0,
+        totalTradedVolume:     c.volume            || 0,
+        change:                c.change            || 0,
+        pChange:               c.percentChange     || 0,
+        bidprice:              c.bid               || 0,
+        askPrice:              c.ask               || 0,
+      };
+    });
+    puts.forEach(p => {
+      const K = p.strike;
+      if (!strikeMap[K]) strikeMap[K] = { strikePrice: K, expiryDate };
+      strikeMap[K].PE = {
+        lastPrice:             p.lastPrice        || 0,
+        impliedVolatility:     (p.impliedVolatility || 0) * 100,
+        openInterest:          p.openInterest      || 0,
+        changeinOpenInterest:  p.openInterest      || 0,
+        totalTradedVolume:     p.volume            || 0,
+        change:                p.change            || 0,
+        pChange:               p.percentChange     || 0,
+        bidprice:              p.bid               || 0,
+        askPrice:              p.ask               || 0,
+      };
+    });
+    rows.push(...Object.values(strikeMap));
+  });
+
+  return {
+    records: {
+      underlyingValue: Math.round(spot),
+      expiryDates,
+      data: rows,
+    },
+    _source: 'yahoo',
+  };
+}
+
+app.get('/api/option-chain-yahoo', async (req, res) => {
+  const symbol = (req.query.symbol || 'NIFTY').toUpperCase();
+  const date   = req.query.date; // optional unix timestamp for specific expiry
+
+  const cacheKey = symbol + (date || '');
+  if (yahooOcCache[cacheKey] && (Date.now() - yahooOcCache[cacheKey].ts) < YAHOO_OC_TTL) {
+    return res.json(yahooOcCache[cacheKey].data);
+  }
+
+  try {
+    // Fetch nearest expiry first, then all expiry dates
+    const first = await fetchYahooOptionChain(symbol);
+    const result = first?.optionChain?.result?.[0];
+    if (!result) throw new Error('No Yahoo option chain result');
+
+    const expiryDates = result.expirationDates || [];
+    // Fetch ALL expiries in parallel (max 6)
+    const allResults = await Promise.all(
+      expiryDates.slice(0, 6).map(ts => fetchYahooOptionChain(symbol, ts).catch(() => null))
+    );
+
+    // Merge into one big result with all expiry options
+    const merged = { ...first };
+    merged.optionChain = { result: [{ ...result, options: allResults.map((r,i) => {
+      const opts = r?.optionChain?.result?.[0]?.options?.[0];
+      return opts || result.options[0] || { calls:[], puts:[] };
+    })}]};
+
+    const nseFormat = yahooToNSEFormat(merged);
+    yahooOcCache[cacheKey] = { data: nseFormat, ts: Date.now() };
+    console.log(`[Yahoo OC] ${symbol}: ${nseFormat.records.data.length} rows, ${nseFormat.records.expiryDates.length} expiries`);
+    res.json(nseFormat);
+  } catch(e) {
+    console.error('[Yahoo OC] Error:', e.message);
+    res.status(502).json({ error: 'Yahoo option chain failed', detail: e.message });
+  }
+});
+
 // ── India VIX ─────────────────────────────────────────────────────────────────
 // India VIX Yahoo Finance ticker: ^INDIAVIX
 app.get('/api/vix', async (req, res) => {

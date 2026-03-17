@@ -2320,6 +2320,120 @@ If no positions are visible, return: []`
 });
 
 // ── Start ──────────────────────────────────────────────────────────────────────
+
+// ── Global Cues / Timezone Arbitrage ─────────────────────────────────────────
+app.get('/api/global-cues', async (req, res) => {
+  try {
+    const symbols = {
+      'GIFT Nifty':    '^NSEBANK',   // proxy — use SGX Nifty via GIFT
+      'Dow Jones':     '^DJI',
+      'S&P 500':       '^GSPC',
+      'Nasdaq':        '^IXIC',
+      'Nikkei 225':    '^N225',
+      'Hang Seng':     '^HSI',
+      'DAX':           '^GDAXI',
+      'Crude Oil':     'CL=F',
+      'Gold':          'GC=F',
+      'USD/INR':       'USDINR=X',
+      'US 10Y Yield':  '^TNX',
+      'Dollar Index':  'DX-Y.NYB',
+      'VIX':           '^VIX',
+      'India VIX':     '^NSEBANK',  // will be overridden below
+    };
+
+    // Fetch GIFT Nifty separately (best pre-market indicator)
+    const giftSymbols = ['NIFTY50.NS', '^NSEI'];
+
+    const tickers = [
+      { key: 'sp500',     sym: '^GSPC',     label: 'S&P 500',       category: 'us' },
+      { key: 'dow',       sym: '^DJI',      label: 'Dow Jones',     category: 'us' },
+      { key: 'nasdaq',    sym: '^IXIC',     label: 'Nasdaq',        category: 'us' },
+      { key: 'vix',       sym: '^VIX',      label: 'US VIX',        category: 'us' },
+      { key: 'nikkei',    sym: '^N225',     label: 'Nikkei 225',    category: 'asia' },
+      { key: 'hangseng',  sym: '^HSI',      label: 'Hang Seng',     category: 'asia' },
+      { key: 'sgxnifty',  sym: 'NIFTY50.NS',label: 'Nifty 50',     category: 'asia' },
+      { key: 'dax',       sym: '^GDAXI',    label: 'DAX',           category: 'europe' },
+      { key: 'crude',     sym: 'CL=F',      label: 'Crude Oil',     category: 'commodities' },
+      { key: 'gold',      sym: 'GC=F',      label: 'Gold',          category: 'commodities' },
+      { key: 'usdinr',    sym: 'USDINR=X',  label: 'USD/INR',       category: 'fx' },
+      { key: 'dxy',       sym: 'DX-Y.NYB',  label: 'Dollar Index',  category: 'fx' },
+      { key: 'us10y',     sym: '^TNX',      label: 'US 10Y Yield',  category: 'bonds' },
+    ];
+
+    const results = {};
+
+    await Promise.all(tickers.map(async ({ key, sym, label, category }) => {
+      try {
+        const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=2d`;
+        const r = await fetch(url, {
+          headers: { 'User-Agent': 'Mozilla/5.0' },
+          signal: AbortSignal.timeout(6000)
+        });
+        const j = await r.json();
+        const meta  = j?.chart?.result?.[0]?.meta;
+        if (!meta) return;
+
+        const price     = meta.regularMarketPrice  || 0;
+        const prevClose = meta.chartPreviousClose   || meta.previousClose || price;
+        const change    = price - prevClose;
+        const changePct = prevClose ? (change / prevClose) * 100 : 0;
+
+        results[key] = {
+          label,
+          category,
+          price:     parseFloat(price.toFixed(2)),
+          change:    parseFloat(change.toFixed(2)),
+          changePct: parseFloat(changePct.toFixed(2)),
+          prevClose: parseFloat(prevClose.toFixed(2)),
+          currency:  meta.currency || '',
+          marketState: meta.marketState || 'CLOSED',
+        };
+      } catch (e) {
+        results[key] = { label, category, error: true };
+      }
+    }));
+
+    // ── Derive Indian market open prediction ─────────────────────────────
+    let bullishCount = 0, bearishCount = 0;
+    const weights = { sp500: 3, nasdaq: 2, dow: 1, nikkei: 2, hangseng: 1, crude: 1, dxy: -1 };
+
+    let score = 0;
+    Object.entries(weights).forEach(([key, w]) => {
+      const d = results[key];
+      if (d && !d.error) {
+        score += (d.changePct > 0 ? 1 : d.changePct < 0 ? -1 : 0) * w;
+      }
+    });
+
+    const totalWeight = Object.values(weights).reduce((a,b) => a + Math.abs(b), 0);
+    const scoreNorm = score / totalWeight; // -1 to +1
+
+    let prediction, predictionColor, gapEst;
+    if (scoreNorm >  0.4) { prediction = 'GAP UP';    predictionColor = 'bullish'; gapEst = '+0.4% to +0.8%'; }
+    else if (scoreNorm >  0.15) { prediction = 'MILDLY BULLISH'; predictionColor = 'bullish'; gapEst = '+0.1% to +0.4%'; }
+    else if (scoreNorm < -0.4) { prediction = 'GAP DOWN';  predictionColor = 'bearish'; gapEst = '-0.4% to -0.8%'; }
+    else if (scoreNorm < -0.15) { prediction = 'MILDLY BEARISH'; predictionColor = 'bearish'; gapEst = '-0.1% to -0.4%'; }
+    else { prediction = 'FLAT OPEN'; predictionColor = 'neutral'; gapEst = '-0.1% to +0.1%'; }
+
+    // Key alerts
+    const alerts = [];
+    if (results.vix && !results.vix.error) {
+      if (results.vix.price > 25)  alerts.push({ type: 'warning', msg: `US VIX at ${results.vix.price} — elevated fear. Expect volatile open.` });
+      if (results.vix.changePct > 10) alerts.push({ type: 'danger', msg: `VIX spiked ${results.vix.changePct.toFixed(1)}% — avoid naked options.` });
+    }
+    if (results.crude && !results.crude.error && Math.abs(results.crude.changePct) > 2)
+      alerts.push({ type: 'info', msg: `Crude oil ${results.crude.changePct > 0 ? 'up' : 'down'} ${Math.abs(results.crude.changePct).toFixed(1)}% — watch OMC stocks (HPCL, BPCL, IOC).` });
+    if (results.usdinr && !results.usdinr.error && results.usdinr.changePct > 0.3)
+      alerts.push({ type: 'warning', msg: `INR weakening (USD/INR ${results.usdinr.price}) — FII selling pressure likely.` });
+    if (results.us10y && !results.us10y.error && results.us10y.price > 4.5)
+      alerts.push({ type: 'info', msg: `US 10Y yield at ${results.us10y.price}% — high rates = pressure on IT/growth stocks.` });
+
+    res.json({ ok: true, data: results, prediction, predictionColor, gapEst, score: parseFloat(scoreNorm.toFixed(3)), alerts, fetchedAt: new Date().toISOString() });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`\n🚀 DeltaBuddy Backend on port ${PORT}`);
   console.log(`💼 Dhan Status:    http://localhost:${PORT}/api/dhan/status`);

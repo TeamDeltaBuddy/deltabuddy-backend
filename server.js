@@ -2322,117 +2322,282 @@ If no positions are visible, return: []`
 // ── Start ──────────────────────────────────────────────────────────────────────
 
 // ── Global Cues / Timezone Arbitrage ─────────────────────────────────────────
+// ── Helper: fetch one Yahoo Finance ticker ───────────────────────────────────
+async function fetchYahooTicker(sym) {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1m&range=1d`;
+  const r = await fetch(url, {
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+    signal: AbortSignal.timeout(7000),
+  });
+  const j = await r.json();
+  const meta = j?.chart?.result?.[0]?.meta;
+  if (!meta) return null;
+  const price     = meta.regularMarketPrice || 0;
+  const prevClose = meta.chartPreviousClose || meta.previousClose || price;
+  const change    = price - prevClose;
+  const changePct = prevClose ? (change / prevClose) * 100 : 0;
+  return {
+    price:     parseFloat(price.toFixed(2)),
+    change:    parseFloat(change.toFixed(2)),
+    changePct: parseFloat(changePct.toFixed(2)),
+    prevClose: parseFloat(prevClose.toFixed(2)),
+    currency:  meta.currency || '',
+    marketState: meta.marketState || 'CLOSED',
+    updatedAt: new Date().toISOString(),
+  };
+}
+
 app.get('/api/global-cues', async (req, res) => {
   try {
-    const symbols = {
-      'GIFT Nifty':    '^NSEBANK',   // proxy — use SGX Nifty via GIFT
-      'Dow Jones':     '^DJI',
-      'S&P 500':       '^GSPC',
-      'Nasdaq':        '^IXIC',
-      'Nikkei 225':    '^N225',
-      'Hang Seng':     '^HSI',
-      'DAX':           '^GDAXI',
-      'Crude Oil':     'CL=F',
-      'Gold':          'GC=F',
-      'USD/INR':       'USDINR=X',
-      'US 10Y Yield':  '^TNX',
-      'Dollar Index':  'DX-Y.NYB',
-      'VIX':           '^VIX',
-      'India VIX':     '^NSEBANK',  // will be overridden below
-    };
-
-    // Fetch GIFT Nifty separately (best pre-market indicator)
-    const giftSymbols = ['NIFTY50.NS', '^NSEI'];
-
+    // ── Fetch all tickers in parallel ────────────────────────────────────────
+    // GIFT Nifty: use interval=1m to get latest intraday price, not just daily close
+    // This catches post-US-close moves like Trump announcements
     const tickers = [
-      { key: 'sp500',     sym: '^GSPC',     label: 'S&P 500',       category: 'us' },
-      { key: 'dow',       sym: '^DJI',      label: 'Dow Jones',     category: 'us' },
-      { key: 'nasdaq',    sym: '^IXIC',     label: 'Nasdaq',        category: 'us' },
-      { key: 'vix',       sym: '^VIX',      label: 'US VIX',        category: 'us' },
-      { key: 'nikkei',    sym: '^N225',     label: 'Nikkei 225',    category: 'asia' },
-      { key: 'hangseng',  sym: '^HSI',      label: 'Hang Seng',     category: 'asia' },
-      { key: 'sgxnifty',  sym: 'NIFTY50.NS',label: 'Nifty 50',     category: 'asia' },
-      { key: 'dax',       sym: '^GDAXI',    label: 'DAX',           category: 'europe' },
-      { key: 'crude',     sym: 'CL=F',      label: 'Crude Oil',     category: 'commodities' },
-      { key: 'gold',      sym: 'GC=F',      label: 'Gold',          category: 'commodities' },
-      { key: 'usdinr',    sym: 'USDINR=X',  label: 'USD/INR',       category: 'fx' },
-      { key: 'dxy',       sym: 'DX-Y.NYB',  label: 'Dollar Index',  category: 'fx' },
-      { key: 'us10y',     sym: '^TNX',      label: 'US 10Y Yield',  category: 'bonds' },
+      // GIFT / SGX Nifty — PRIMARY signal, highest weight
+      { key: 'giftnifty', sym: 'NIFTY50.NS',  label: 'GIFT Nifty (Proxy)', category: 'gift' },
+      { key: 'giftnifty2',sym: '^NSEI',        label: 'Nifty Index',        category: 'gift' },
+      // US Markets
+      { key: 'sp500',     sym: '^GSPC',        label: 'S&P 500',            category: 'us'   },
+      { key: 'dow',       sym: '^DJI',         label: 'Dow Jones',          category: 'us'   },
+      { key: 'nasdaq',    sym: '^IXIC',        label: 'Nasdaq',             category: 'us'   },
+      { key: 'vix',       sym: '^VIX',         label: 'US VIX',             category: 'us'   },
+      // Asia
+      { key: 'nikkei',    sym: '^N225',        label: 'Nikkei 225',         category: 'asia' },
+      { key: 'hangseng',  sym: '^HSI',         label: 'Hang Seng',          category: 'asia' },
+      // Europe
+      { key: 'dax',       sym: '^GDAXI',       label: 'DAX',                category: 'europe'},
+      // Commodities
+      { key: 'crude',     sym: 'CL=F',         label: 'Crude Oil (WTI)',    category: 'commodities'},
+      { key: 'gold',      sym: 'GC=F',         label: 'Gold',               category: 'commodities'},
+      // FX & Bonds
+      { key: 'usdinr',    sym: 'USDINR=X',     label: 'USD/INR',            category: 'fx'   },
+      { key: 'dxy',       sym: 'DX-Y.NYB',     label: 'Dollar Index',       category: 'fx'   },
+      { key: 'us10y',     sym: '^TNX',         label: 'US 10Y Yield',       category: 'bonds'},
     ];
 
     const results = {};
-
     await Promise.all(tickers.map(async ({ key, sym, label, category }) => {
       try {
-        const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=2d`;
-        const r = await fetch(url, {
-          headers: { 'User-Agent': 'Mozilla/5.0' },
-          signal: AbortSignal.timeout(6000)
-        });
-        const j = await r.json();
-        const meta  = j?.chart?.result?.[0]?.meta;
-        if (!meta) return;
-
-        const price     = meta.regularMarketPrice  || 0;
-        const prevClose = meta.chartPreviousClose   || meta.previousClose || price;
-        const change    = price - prevClose;
-        const changePct = prevClose ? (change / prevClose) * 100 : 0;
-
-        results[key] = {
-          label,
-          category,
-          price:     parseFloat(price.toFixed(2)),
-          change:    parseFloat(change.toFixed(2)),
-          changePct: parseFloat(changePct.toFixed(2)),
-          prevClose: parseFloat(prevClose.toFixed(2)),
-          currency:  meta.currency || '',
-          marketState: meta.marketState || 'CLOSED',
-        };
-      } catch (e) {
+        const d = await fetchYahooTicker(sym);
+        if (d) results[key] = { label, category, ...d };
+        else   results[key] = { label, category, error: true };
+      } catch(e) {
         results[key] = { label, category, error: true };
       }
     }));
 
-    // ── Derive Indian market open prediction ─────────────────────────────
-    let bullishCount = 0, bearishCount = 0;
-    const weights = { sp500: 3, nasdaq: 2, dow: 1, nikkei: 2, hangseng: 1, crude: 1, dxy: -1 };
+    // ── GIFT Nifty: use best available proxy ─────────────────────────────────
+    // giftnifty2 (^NSEI) is more accurate for real-time moves
+    const giftData = (!results.giftnifty2?.error && results.giftnifty2?.changePct != null)
+      ? results.giftnifty2
+      : results.giftnifty;
+    const giftPct  = giftData?.changePct || 0;
+    const giftAvail = giftData && !giftData.error;
 
-    let score = 0;
-    Object.entries(weights).forEach(([key, w]) => {
-      const d = results[key];
-      if (d && !d.error) {
-        score += (d.changePct > 0 ? 1 : d.changePct < 0 ? -1 : 0) * w;
-      }
-    });
+    // Clean up display — merge into single entry
+    results['giftnifty'] = { ...giftData, label: 'GIFT Nifty / Nifty Fut', category: 'gift' };
+    delete results['giftnifty2'];
 
-    const totalWeight = Object.values(weights).reduce((a,b) => a + Math.abs(b), 0);
-    const scoreNorm = score / totalWeight; // -1 to +1
+    // ── Prediction logic — GIFT Nifty is the PRIMARY override ────────────────
+    // Rule: if GIFT Nifty has a strong move, it OVERRIDES everything else
+    // because it reflects post-market news (Trump tariffs, Fed surprise etc.)
+    let prediction, predictionColor, gapEst, giftOverride = false;
+    let dataStale = false;
 
-    let prediction, predictionColor, gapEst;
-    if (scoreNorm >  0.4) { prediction = 'GAP UP';    predictionColor = 'bullish'; gapEst = '+0.4% to +0.8%'; }
-    else if (scoreNorm >  0.15) { prediction = 'MILDLY BULLISH'; predictionColor = 'bullish'; gapEst = '+0.1% to +0.4%'; }
-    else if (scoreNorm < -0.4) { prediction = 'GAP DOWN';  predictionColor = 'bearish'; gapEst = '-0.4% to -0.8%'; }
-    else if (scoreNorm < -0.15) { prediction = 'MILDLY BEARISH'; predictionColor = 'bearish'; gapEst = '-0.1% to -0.4%'; }
-    else { prediction = 'FLAT OPEN'; predictionColor = 'neutral'; gapEst = '-0.1% to +0.1%'; }
+    // Check if US market is closed (then our US data is yesterday's close)
+    const nowUTC    = new Date();
+    const nowIST    = new Date(nowUTC.getTime() + 5.5 * 3600000);
+    const hourIST   = nowIST.getUTCHours() + nowIST.getUTCMinutes() / 60;
+    // US market is open 19:30–02:00 IST. Outside that, US data = yesterday's close
+    const usMktOpen = hourIST >= 19.5 || hourIST < 2.0;
+    if (!usMktOpen) dataStale = true;
 
-    // Key alerts
+    // GIFT Nifty override thresholds
+    if (giftAvail && Math.abs(giftPct) >= 1.5) {
+      giftOverride = true;
+      if      (giftPct >= 2.5) { prediction = 'STRONG GAP UP';   predictionColor = 'bullish'; gapEst = `+${giftPct.toFixed(1)}% (GIFT Nifty driven)`; }
+      else if (giftPct >= 1.5) { prediction = 'GAP UP';          predictionColor = 'bullish'; gapEst = `+${giftPct.toFixed(1)}% (GIFT Nifty driven)`; }
+      else if (giftPct <= -2.5){ prediction = 'STRONG GAP DOWN'; predictionColor = 'bearish'; gapEst = `${giftPct.toFixed(1)}% (GIFT Nifty driven)`; }
+      else                      { prediction = 'GAP DOWN';        predictionColor = 'bearish'; gapEst = `${giftPct.toFixed(1)}% (GIFT Nifty driven)`; }
+    } else {
+      // GIFT Nifty move < 1.5% — use weighted model of other markets
+      // GIFT Nifty still gets highest weight (10), everything else secondary
+      const weights = {
+        giftnifty: 10,   // <<< PRIMARY — 10x weight
+        sp500:      3,
+        nasdaq:     2,
+        nikkei:     2,
+        dow:        1,
+        hangseng:   1,
+        crude:      1,
+        dxy:       -1,   // dollar up = INR down = FII selling
+      };
+      let score = 0;
+      const totalWeight = Object.values(weights).reduce((a,b) => a + Math.abs(b), 0);
+      Object.entries(weights).forEach(([key, w]) => {
+        const d = results[key];
+        if (d && !d.error && d.changePct != null) {
+          score += (d.changePct > 0 ? 1 : d.changePct < 0 ? -1 : 0) * w;
+        }
+      });
+      const scoreNorm = score / totalWeight;
+
+      if      (scoreNorm >  0.5) { prediction = 'GAP UP';          predictionColor = 'bullish'; gapEst = '+0.5% to +1.0%'; }
+      else if (scoreNorm >  0.2) { prediction = 'MILDLY BULLISH';  predictionColor = 'bullish'; gapEst = '+0.1% to +0.5%'; }
+      else if (scoreNorm < -0.5) { prediction = 'GAP DOWN';        predictionColor = 'bearish'; gapEst = '-0.5% to -1.0%'; }
+      else if (scoreNorm < -0.2) { prediction = 'MILDLY BEARISH';  predictionColor = 'bearish'; gapEst = '-0.1% to -0.5%'; }
+      else                        { prediction = 'FLAT OPEN';       predictionColor = 'neutral'; gapEst = '-0.1% to +0.1%'; }
+    }
+
+    // ── Smart Alerts ─────────────────────────────────────────────────────────
     const alerts = [];
+
+    // GIFT Nifty alert — always show if significant
+    if (giftAvail && Math.abs(giftPct) >= 1.0) {
+      alerts.push({
+        type: giftPct > 0 ? 'info' : 'warning',
+        msg: `GIFT Nifty ${giftPct > 0 ? '▲' : '▼'} ${Math.abs(giftPct).toFixed(2)}% — ${giftPct > 0 ? 'Gap up expected at 9:15 AM. CE premiums will inflate on open.' : 'Gap down expected. PE premiums will inflate on open.'}`,
+        priority: true,
+      });
+    }
+
+    if (giftOverride && dataStale) {
+      alerts.push({ type: 'warning', msg: '⚠️ US markets are closed. Prediction based on GIFT Nifty only — most accurate for Indian open.', priority: false });
+    }
+    if (!giftOverride && dataStale) {
+      alerts.push({ type: 'warning', msg: '⚠️ US markets closed. Data shows yesterday\'s closing prices. GIFT Nifty is the best real-time indicator.', priority: false });
+    }
+
     if (results.vix && !results.vix.error) {
-      if (results.vix.price > 25)  alerts.push({ type: 'warning', msg: `US VIX at ${results.vix.price} — elevated fear. Expect volatile open.` });
-      if (results.vix.changePct > 10) alerts.push({ type: 'danger', msg: `VIX spiked ${results.vix.changePct.toFixed(1)}% — avoid naked options.` });
+      if (results.vix.price > 25)   alerts.push({ type: 'danger',  msg: `US VIX at ${results.vix.price} — extreme fear. Expect high IV on Indian options.` });
+      else if (results.vix.price > 20) alerts.push({ type: 'warning', msg: `US VIX at ${results.vix.price} — elevated. Options will be expensive today.` });
+      if (results.vix.changePct > 15) alerts.push({ type: 'danger', msg: `VIX spiked ${results.vix.changePct.toFixed(1)}% overnight — avoid naked options, use spreads.` });
     }
     if (results.crude && !results.crude.error && Math.abs(results.crude.changePct) > 2)
-      alerts.push({ type: 'info', msg: `Crude oil ${results.crude.changePct > 0 ? 'up' : 'down'} ${Math.abs(results.crude.changePct).toFixed(1)}% — watch OMC stocks (HPCL, BPCL, IOC).` });
-    if (results.usdinr && !results.usdinr.error && results.usdinr.changePct > 0.3)
-      alerts.push({ type: 'warning', msg: `INR weakening (USD/INR ${results.usdinr.price}) — FII selling pressure likely.` });
+      alerts.push({ type: 'info', msg: `Crude ${results.crude.changePct > 0 ? '▲' : '▼'} ${Math.abs(results.crude.changePct).toFixed(1)}% — watch HPCL, BPCL, IOC, ONGC.` });
+    if (results.usdinr && !results.usdinr.error) {
+      if (results.usdinr.changePct > 0.4)  alerts.push({ type: 'warning', msg: `INR weakening ₹${results.usdinr.price}/$ — FII outflow pressure. IT exporters may benefit.` });
+      if (results.usdinr.changePct < -0.4) alerts.push({ type: 'info',    msg: `INR strengthening ₹${results.usdinr.price}/$ — FII inflow positive.` });
+    }
     if (results.us10y && !results.us10y.error && results.us10y.price > 4.5)
-      alerts.push({ type: 'info', msg: `US 10Y yield at ${results.us10y.price}% — high rates = pressure on IT/growth stocks.` });
+      alerts.push({ type: 'info', msg: `US 10Y yield ${results.us10y.price}% — high rates favour value over growth. Watch IT/banks divergence.` });
+    if (results.gold && !results.gold.error && results.gold.changePct > 1.5)
+      alerts.push({ type: 'info', msg: `Gold ▲ ${results.gold.changePct.toFixed(1)}% — risk-off sentiment. Defensive trades favoured.` });
 
-    res.json({ ok: true, data: results, prediction, predictionColor, gapEst, score: parseFloat(scoreNorm.toFixed(3)), alerts, fetchedAt: new Date().toISOString() });
+    // Sort alerts — priority ones first
+    alerts.sort((a, b) => (b.priority ? 1 : 0) - (a.priority ? 1 : 0));
+
+    res.json({
+      ok: true, data: results,
+      prediction, predictionColor, gapEst,
+      giftPct: parseFloat(giftPct.toFixed(2)),
+      giftOverride, dataStale,
+      alerts,
+      fetchedAt: new Date().toISOString(),
+    });
   } catch (e) {
     res.json({ ok: false, error: e.message });
   }
 });
+
+
+// ── Pre-Market Alert Engine ───────────────────────────────────────────────────
+// Runs every 5 minutes from 7:30 AM to 9:20 AM IST
+// Fires Telegram alert if GIFT Nifty moves ±1.5% or more
+// Also monitors for big post-market moves (10 PM - 2 AM IST) after US events
+
+let lastPremarketAlertPct = null;   // track last alerted % to avoid spam
+let lastPremarketAlertTime = 0;
+
+async function checkPremarketGiftNifty() {
+  try {
+    const nowUTC  = new Date();
+    const nowIST  = new Date(nowUTC.getTime() + 5.5 * 3600000);
+    const hourIST = nowIST.getUTCHours() + nowIST.getUTCMinutes() / 60;
+
+    // Run during: 7:30–9:20 AM IST (pre-market window)
+    //         and 22:00–02:00 IST (after US market open — catches evening news)
+    const inPremarket  = hourIST >= 7.5  && hourIST <= 9.33;
+    const inUSSession  = hourIST >= 22.0 || hourIST <= 2.0;
+    if (!inPremarket && !inUSSession) return;
+
+    // Fetch GIFT Nifty proxy
+    const [d1, d2] = await Promise.all([
+      fetchYahooTicker('NIFTY50.NS'),
+      fetchYahooTicker('^NSEI'),
+    ]);
+
+    // Use whichever gives a valid reading
+    const best = (!d2?.error && d2?.changePct != null) ? d2 : d1;
+    if (!best || best.error) return;
+
+    const pct = parseFloat(best.changePct.toFixed(2));
+    const abs = Math.abs(pct);
+
+    // Threshold: alert if move >= 1.5%
+    // Don't re-alert for same move within 30 minutes
+    const timeSinceLast = Date.now() - lastPremarketAlertTime;
+    const moveShifted   = lastPremarketAlertPct === null || Math.abs(pct - lastPremarketAlertPct) >= 0.5;
+
+    if (abs >= 1.5 && (timeSinceLast > 30 * 60000 || moveShifted)) {
+      lastPremarketAlertPct  = pct;
+      lastPremarketAlertTime = Date.now();
+
+      const direction  = pct > 0 ? '📈 GAP UP' : '📉 GAP DOWN';
+      const emoji      = pct > 0 ? '🟢' : '🔴';
+      const timeLabel  = inPremarket ? 'Pre-Market Alert' : 'Post-Market Alert';
+
+      // Estimate ATM strike for 9:15 open
+      // We don't have exact spot here but can estimate from % move
+      const strikeHint = pct > 0
+        ? 'CE premiums will inflate on open — avoid buying CE at open price, wait 5 min'
+        : 'PE premiums will inflate on open — avoid buying PE at open price, wait 5 min';
+
+      const urgency = abs >= 2.5 ? '🚨 MAJOR MOVE' : abs >= 1.5 ? '⚠️ SIGNIFICANT MOVE' : '';
+
+      const msg = [
+        `${emoji} *DeltaBuddy ${timeLabel}*`,
+        ``,
+        `${urgency ? urgency + '\n' : ''}*GIFT Nifty: ${pct > 0 ? '+' : ''}${pct}%*`,
+        `Expected open: *${direction}*`,
+        ``,
+        `📌 ${strikeHint}`,
+        ``,
+        abs >= 2.0 ? `💡 *Strategy tip:* Large gap = high IV open. Consider selling premium (straddle/strangle) after first 5 min candle forms, not buying.` : `💡 *Strategy tip:* Wait for first 5-min candle to close before taking directional trades.`,
+        ``,
+        `_Updated: ${nowIST.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })} IST_`,
+        `_Data: Yahoo Finance proxy — verify on NSE IFSC_`,
+      ].join('\n');
+
+      // Send to all subscribers
+      const subs = getSubscribers();
+      console.log(`[Pre-Market] GIFT Nifty ${pct}% — alerting ${subs.length} subscribers`);
+
+      let sent = 0;
+      for (const chatId of subs) {
+        try {
+          await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, text: msg, parse_mode: 'Markdown' }),
+          });
+          sent++;
+        } catch(e) {}
+      }
+      console.log(`[Pre-Market] Sent to ${sent}/${subs.length} subscribers`);
+    }
+  } catch(e) {
+    console.error('[Pre-Market] Error:', e.message);
+  }
+}
+
+function startPremarketMonitor() {
+  // Check every 5 minutes
+  setInterval(checkPremarketGiftNifty, 5 * 60 * 1000);
+  // Also run immediately on startup to catch any existing move
+  setTimeout(checkPremarketGiftNifty, 10000);
+  console.log('[Pre-Market] Monitor started — checking GIFT Nifty every 5 min');
+}
 
 app.listen(PORT, () => {
   console.log(`\n🚀 DeltaBuddy Backend on port ${PORT}`);
@@ -2442,6 +2607,7 @@ app.listen(PORT, () => {
   console.log(`[Dhan] Configured: ${!!(DHAN_CLIENT_ID && DHAN_ACCESS_TOKEN)}`);
   getNSECookies();
   startAlertEngine();
+  startPremarketMonitor();
 
   // Load subscribers from Firestore then refresh every 5 minutes
   loadSubscribersFromFirestore();

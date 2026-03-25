@@ -2599,6 +2599,228 @@ function startPremarketMonitor() {
   console.log('[Pre-Market] Monitor started — checking GIFT Nifty every 5 min');
 }
 
+
+// ── US Yield Intelligence ─────────────────────────────────────────────────────
+app.get('/api/yield-intel', async (req, res) => {
+  try {
+    // Fetch yield curve data + related assets in parallel
+    const symbols = [
+      { key: 'y3m',   sym: '^IRX',     label: '3-Month T-Bill' },
+      { key: 'y2',    sym: '^UST2Y',   label: '2Y Treasury'    },
+      { key: 'y5',    sym: '^FVX',     label: '5Y Treasury'    },
+      { key: 'y10',   sym: '^TNX',     label: '10Y Treasury'   },
+      { key: 'y30',   sym: '^TYX',     label: '30Y Treasury'   },
+      { key: 'usdinr',sym: 'USDINR=X', label: 'USD/INR'        },
+      { key: 'dxy',   sym: 'DX-Y.NYB', label: 'Dollar Index'   },
+      { key: 'gold',  sym: 'GC=F',     label: 'Gold'           },
+      { key: 'sp500', sym: '^GSPC',    label: 'S&P 500'        },
+      { key: 'vix',   sym: '^VIX',     label: 'US VIX'         },
+    ];
+
+    const raw = {};
+    await Promise.all(symbols.map(async ({ key, sym }) => {
+      try {
+        const d = await fetchYahooTicker(sym);
+        if (d) raw[key] = d;
+      } catch(e) {}
+    }));
+
+    // ── Yield curve shape ────────────────────────────────────────────────────
+    const y10  = raw.y10?.price  || 0;
+    const y2   = raw.y2?.price   || 0;
+    const y3m  = raw.y3m?.price  || 0;
+    const y30  = raw.y30?.price  || 0;
+    const y10c = raw.y10?.changePct || 0;
+    const y2c  = raw.y2?.changePct  || 0;
+
+    // Spread = 10Y minus 2Y (classic recession indicator)
+    const spread_10_2   = parseFloat((y10 - y2).toFixed(3));
+    const spread_10_3m  = parseFloat((y10 - y3m).toFixed(3));
+
+    let curveStatus, curveDesc, curveColor;
+    if (spread_10_2 < -0.5) {
+      curveStatus = 'DEEPLY INVERTED';
+      curveColor  = 'danger';
+      curveDesc   = 'Recession probability high. Historical accuracy ~80% within 12-18 months. Reduce equity risk.';
+    } else if (spread_10_2 < 0) {
+      curveStatus = 'INVERTED';
+      curveColor  = 'warning';
+      curveDesc   = 'Curve inverted — markets pricing in rate cuts. FII flows to India may slow.';
+    } else if (spread_10_2 < 0.5) {
+      curveStatus = 'FLAT';
+      curveColor  = 'neutral';
+      curveDesc   = 'Flat curve — uncertain outlook. Volatility likely to remain elevated.';
+    } else if (spread_10_2 < 1.5) {
+      curveStatus = 'NORMAL';
+      curveColor  = 'bullish';
+      curveDesc   = 'Healthy curve. Growth expected. Positive for risk assets including Indian equities.';
+    } else {
+      curveStatus = 'STEEP';
+      curveColor  = 'bullish';
+      curveDesc   = 'Steep curve — strong growth expectations. Cyclicals and banks favoured.';
+    }
+
+    // ── Four signals ─────────────────────────────────────────────────────────
+    const signals = [];
+
+    // Signal 1: Yield Spike
+    const yieldSpike = Math.abs(y10c) >= 5; // 5% move in yield = ~0.10-0.15 bps
+    const yieldRising = y10c > 0;
+    signals.push({
+      id: 'yield_spike',
+      name: 'Yield Spike Alert',
+      status: yieldSpike ? 'ACTIVE' : Math.abs(y10c) >= 2.5 ? 'WATCH' : 'CLEAR',
+      direction: yieldRising ? 'bearish' : 'bullish',
+      trigger: `10Y ${y10c > 0 ? '+' : ''}${y10c.toFixed(2)}% today (${y10.toFixed(2)}%)`,
+      impact: yieldRising
+        ? 'Bearish for Nifty. FII likely to sell bonds + equities. Gap down risk tomorrow.'
+        : 'Bullish for Nifty. Dollar weakens, FII inflows likely. Gap up possible.',
+      actions: yieldRising ? [
+        'Avoid fresh CE buys today',
+        'Watch USD/INR — if INR weakens >0.3%, FII selling confirmed',
+        'IT exporters may benefit (Infosys, TCS, Wipro)',
+        'Sell Nifty calls / buy puts for positional trade',
+      ] : [
+        'Bullish setup — dip buyers may emerge',
+        'Banking and NBFC stocks likely to rally',
+        'Watch for FII buying in F&O data',
+      ],
+      lag: '1 session',
+    });
+
+    // Signal 2: Yield Curve Inversion
+    signals.push({
+      id: 'inversion',
+      name: 'Yield Curve Signal',
+      status: spread_10_2 < 0 ? 'ACTIVE' : spread_10_2 < 0.3 ? 'WATCH' : 'CLEAR',
+      direction: spread_10_2 < 0 ? 'bearish' : 'neutral',
+      trigger: `10Y−2Y spread: ${spread_10_2 > 0 ? '+' : ''}${spread_10_2}%`,
+      impact: curveDesc,
+      curveStatus,
+      actions: spread_10_2 < 0 ? [
+        'Reduce directional F&O positions — volatility unpredictable',
+        'Avoid NBFC and rate-sensitive stocks',
+        'FMCG, Pharma relatively defensive',
+        'Prefer options selling over buying (collect premium during uncertainty)',
+      ] : [
+        'Curve healthy — maintain normal trading',
+        'Cyclicals and banks favoured in steep curve',
+      ],
+      lag: 'Days to weeks',
+    });
+
+    // Signal 3: Yield-INR Divergence (yield up but INR stable = RBI defending)
+    const yieldUp   = y10c > 3;
+    const inrStable = Math.abs(raw.usdinr?.changePct || 0) < 0.2;
+    const divergence = yieldUp && inrStable;
+    const inrWeakening = (raw.usdinr?.changePct || 0) > 0.3;
+    signals.push({
+      id: 'inr_divergence',
+      name: 'Yield-INR Divergence',
+      status: divergence ? 'ACTIVE' : inrWeakening ? 'WATCH' : 'CLEAR',
+      direction: divergence ? 'warning' : 'neutral',
+      trigger: `Yield ${y10c > 0 ? '+' : ''}${y10c.toFixed(2)}% | INR change: ${(raw.usdinr?.changePct || 0).toFixed(2)}%`,
+      impact: divergence
+        ? 'Yield rising but INR stable — RBI likely defending rupee. This is unsustainable. INR depreciation coming in 2–5 sessions.'
+        : inrWeakening
+        ? 'INR weakening — could signal FII outflows beginning.'
+        : 'Yield and INR moving together normally. No divergence.',
+      actions: divergence ? [
+        'Position for INR weakness in next 2–5 sessions',
+        'IT exporters will benefit when INR eventually falls',
+        'Avoid import-heavy sectors (crude-dependent)',
+        'Watch RBI interventions as signal of pressure',
+      ] : [],
+      lag: '2–5 sessions',
+    });
+
+    // Signal 4: Real Yield (Nominal 10Y minus approximate inflation)
+    // We don't have live CPI but can use VIX as a risk-off proxy
+    // Real yield approximation: if 10Y > 4.5% AND VIX < 20 = positive real yield = risk-off for EM
+    const highRealYield = y10 > 4.5;
+    const lowVix = (raw.vix?.price || 20) < 20;
+    const realYieldPressure = highRealYield && lowVix; // money flows to US, not EM
+    signals.push({
+      id: 'real_yield',
+      name: 'Real Yield Pressure',
+      status: realYieldPressure ? 'ACTIVE' : highRealYield ? 'WATCH' : 'CLEAR',
+      direction: realYieldPressure ? 'bearish' : 'neutral',
+      trigger: `10Y at ${y10.toFixed(2)}% | VIX ${raw.vix?.price?.toFixed(1) || 'N/A'}`,
+      impact: realYieldPressure
+        ? `US real yields positive and VIX calm — global money prefers US assets over Emerging Markets. Sustained FII outflows from India likely.`
+        : highRealYield
+        ? `10Y above 4.5% — watch for FII rotation away from India if VIX stays calm.`
+        : `Real yield pressure low. Emerging market flows including India are supported.`,
+      actions: realYieldPressure ? [
+        'FII selling likely to continue — avoid fighting the trend',
+        'Gold may underperform (real yield negative for gold)',
+        'Defensive positioning: reduce naked longs on Nifty',
+        'Monitor FII/DII data daily for confirmation',
+      ] : [],
+      lag: 'Days to weeks',
+    });
+
+    // ── Overall market bias ───────────────────────────────────────────────────
+    const activeSignals = signals.filter(s => s.status === 'ACTIVE');
+    const bearishSignals = activeSignals.filter(s => s.direction === 'bearish' || s.direction === 'warning').length;
+    const bullishSignals = activeSignals.filter(s => s.direction === 'bullish').length;
+
+    let overallBias, biasColor;
+    if (bearishSignals >= 2)      { overallBias = 'YIELD BEARISH — Reduce Nifty longs'; biasColor = 'bearish'; }
+    else if (bearishSignals === 1) { overallBias = 'MILD CAUTION — Trade smaller size';  biasColor = 'warning'; }
+    else if (bullishSignals >= 1)  { overallBias = 'YIELD SUPPORTIVE — Bullish bias';    biasColor = 'bullish'; }
+    else                           { overallBias = 'NEUTRAL — No yield-based edge';       biasColor = 'neutral'; }
+
+    // ── Telegram alert for active signals ────────────────────────────────────
+    const newActive = activeSignals.filter(s => s.direction === 'bearish' || s.direction === 'warning');
+    if (newActive.length > 0 && req.query.alert === 'true') {
+      const msg = [
+        `📊 *DeltaBuddy — Yield Intelligence Alert*`,
+        ``,
+        `*${overallBias}*`,
+        ``,
+        ...newActive.map(s => `🔴 *${s.name}*\n${s.trigger}\n${s.impact}`),
+        ``,
+        `_US 10Y: ${y10.toFixed(2)}% | Spread: ${spread_10_2}% | USD/INR: ${raw.usdinr?.price || 'N/A'}_`,
+      ].join('\n');
+
+      const subs = getSubscribers();
+      for (const chatId of subs) {
+        try {
+          await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, text: msg, parse_mode: 'Markdown' }),
+          });
+        } catch(e) {}
+      }
+    }
+
+    res.json({
+      ok: true,
+      yields: {
+        y3m:  { label: '3M', price: y3m,  change: raw.y3m?.changePct  || 0 },
+        y2:   { label: '2Y', price: y2,   change: raw.y2?.changePct   || 0 },
+        y5:   { label: '5Y', price: raw.y5?.price || 0, change: raw.y5?.changePct || 0 },
+        y10:  { label: '10Y',price: y10,  change: y10c },
+        y30:  { label: '30Y',price: y30,  change: raw.y30?.changePct  || 0 },
+      },
+      spread_10_2, spread_10_3m,
+      curveStatus, curveDesc, curveColor,
+      signals, overallBias, biasColor,
+      related: {
+        usdinr: { price: raw.usdinr?.price, change: raw.usdinr?.changePct },
+        dxy:    { price: raw.dxy?.price,    change: raw.dxy?.changePct    },
+        gold:   { price: raw.gold?.price,   change: raw.gold?.changePct   },
+        vix:    { price: raw.vix?.price,    change: raw.vix?.changePct    },
+      },
+      fetchedAt: new Date().toISOString(),
+    });
+
+  } catch(e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
 app.listen(PORT, () => {
   console.log(`\n🚀 DeltaBuddy Backend on port ${PORT}`);
   console.log(`💼 Dhan Status:    http://localhost:${PORT}/api/dhan/status`);

@@ -553,6 +553,23 @@ app.get('/api/nse-quotes', async (req, res) => {
     if (nseQuoteCache) {
       return res.json({ ...nseQuoteCache, _stale: true, _error: e.message });
     }
+    // Fallback: return Yahoo Finance data for key indices
+    console.log('[NSE Quotes] Falling back to Yahoo Finance...');
+    try {
+      const yahooSymbols = [
+        { key: 'NIFTY 50',   sym: '^NSEI'  },
+        { key: 'NIFTY BANK', sym: '^NSEBANK'},
+        { key: 'India VIX',  sym: '^INDIAVIX'},
+      ];
+      const fallback = {};
+      await Promise.all(yahooSymbols.map(async ({ key, sym }) => {
+        try {
+          const d = await fetchYahooTicker(sym);
+          if (d) fallback[key] = { price: d.price, change: d.changePct, prevClose: d.prevClose, type: 'index' };
+        } catch(e) {}
+      }));
+      if (Object.keys(fallback).length > 0) return res.json({ ...fallback, _source: 'yahoo_fallback' });
+    } catch(fe) {}
     res.status(502).json({ error: 'NSE quotes failed', detail: e.message });
   }
 });

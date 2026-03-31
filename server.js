@@ -232,6 +232,68 @@ app.get('/api/dhan/option-chain', async (req, res) => {
     return res.json(dhanOcCache[symbol].data);
   }
 
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  function toNSEDate(d) {
+    const [y, m, day] = d.split('-');
+    return `${day}-${months[parseInt(m)-1]}-${y}`;
+  }
+
+  // Parse Dhan OC format: { data: { last_price, oc: { "strike": { ce, pe } } } }
+  function parseDhanOC(ocRes, expiry) {
+    const expiryNSE = toNSEDate(expiry);
+    const spot   = ocRes?.data?.last_price || ocRes?.last_price || 0;
+    const ocObj  = ocRes?.data?.oc || ocRes?.oc || {};
+    const rows   = [];
+
+    Object.entries(ocObj).forEach(([strikeStr, sides]) => {
+      const strike = parseFloat(strikeStr);
+      if (!strike) return;
+      const row = { strikePrice: strike, expiryDate: expiryNSE };
+
+      const ce = sides?.ce || {};
+      row.CE = {
+        lastPrice:            ce.last_price          || 0,
+        impliedVolatility:    ce.implied_volatility   || 0,
+        openInterest:         ce.oi                   || 0,
+        changeinOpenInterest: (ce.oi || 0) - (ce.previous_oi || 0),
+        totalTradedVolume:    ce.volume               || 0,
+        change:               (ce.last_price || 0) - (ce.previous_close_price || 0),
+        pChange:              ce.previous_close_price > 0
+                              ? (((ce.last_price||0) - ce.previous_close_price) / ce.previous_close_price * 100) : 0,
+        bidprice:             ce.top_bid_price        || 0,
+        askPrice:             ce.top_ask_price        || 0,
+        delta:                ce.greeks?.delta        || 0,
+        theta:                ce.greeks?.theta        || 0,
+        gamma:                ce.greeks?.gamma        || 0,
+        vega:                 ce.greeks?.vega         || 0,
+      };
+
+      const pe = sides?.pe || {};
+      row.PE = {
+        lastPrice:            pe.last_price          || 0,
+        impliedVolatility:    pe.implied_volatility   || 0,
+        openInterest:         pe.oi                   || 0,
+        changeinOpenInterest: (pe.oi || 0) - (pe.previous_oi || 0),
+        totalTradedVolume:    pe.volume               || 0,
+        change:               (pe.last_price || 0) - (pe.previous_close_price || 0),
+        pChange:              pe.previous_close_price > 0
+                              ? (((pe.last_price||0) - pe.previous_close_price) / pe.previous_close_price * 100) : 0,
+        bidprice:             pe.top_bid_price        || 0,
+        askPrice:             pe.top_ask_price        || 0,
+        delta:                pe.greeks?.delta        || 0,
+        theta:                pe.greeks?.theta        || 0,
+        gamma:                pe.greeks?.gamma        || 0,
+        vega:                 pe.greeks?.vega         || 0,
+      };
+
+      rows.push(row);
+    });
+
+    // Sort by strike ascending
+    rows.sort((a, b) => a.strikePrice - b.strikePrice);
+    return { rows, spot };
+  }
+
   try {
     // Step 1: Get expiry list
     const expiryRes = await dhanAPI('/v2/optionchain/expirylist', 'POST', {
@@ -242,62 +304,22 @@ app.get('/api/dhan/option-chain', async (req, res) => {
     if (!expiries.length) throw new Error('No expiries from Dhan');
     console.log(`[Dhan OC] ${symbol} expiries:`, expiries.slice(0, 4));
 
-    // Step 2: Fetch all expiries (up to 5) in parallel
-    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-    function toNSEDate(d) {
-      const [y, m, day] = d.split('-');
-      return `${day}-${months[parseInt(m)-1]}-${y}`;
-    }
-
+    // Step 2: Fetch nearest 3 expiries in parallel
+    const nseExpiries = expiries.slice(0, 3).map(toNSEDate);
     const allRows = [];
-    const nseExpiries = expiries.slice(0, 5).map(toNSEDate);
+    let spotPrice = 0;
 
-    await Promise.all(expiries.slice(0, 5).map(async (expiry) => {
+    await Promise.all(expiries.slice(0, 3).map(async (expiry) => {
       try {
         const ocRes = await dhanAPI('/v2/optionchain', 'POST', {
           UnderlyingScrip: scrip.scrip,
           UnderlyingSeg:   scrip.seg,
           Expiry:          expiry,
         });
-        const spot  = ocRes?.last_price || ocRes?.underlyingLastPrice || 0;
-        const chains = ocRes?.data || ocRes?.oc_data || [];
-        const expiryNSE = toNSEDate(expiry);
-
-        chains.forEach(row => {
-          const r = { strikePrice: row.strike_price || row.strikePrice, expiryDate: expiryNSE };
-          if (row.call_options || row.ce) {
-            const ce = row.call_options || row.ce || {};
-            r.CE = {
-              lastPrice:            ce.last_price          || ce.ltp          || 0,
-              impliedVolatility:    ce.implied_volatility   || ce.iv           || 0,
-              openInterest:         ce.oi                   || ce.open_interest || 0,
-              changeinOpenInterest: ce.oi_change            || 0,
-              totalTradedVolume:    ce.volume               || 0,
-              change:               ce.net_change           || 0,
-              pChange:              ce.percent_change       || 0,
-              bidprice:             ce.bid_price            || 0,
-              askPrice:             ce.ask_price            || 0,
-            };
-          }
-          if (row.put_options || row.pe) {
-            const pe = row.put_options || row.pe || {};
-            r.PE = {
-              lastPrice:            pe.last_price           || pe.ltp          || 0,
-              impliedVolatility:    pe.implied_volatility    || pe.iv           || 0,
-              openInterest:         pe.oi                    || pe.open_interest || 0,
-              changeinOpenInterest: pe.oi_change             || 0,
-              totalTradedVolume:    pe.volume                || 0,
-              change:               pe.net_change            || 0,
-              pChange:              pe.percent_change        || 0,
-              bidprice:             pe.bid_price             || 0,
-              askPrice:             pe.ask_price             || 0,
-            };
-          }
-          allRows.push(r);
-        });
-
-        // Capture spot from first expiry
-        if (spot && !dhanOcCache[symbol + '_spot']) dhanOcCache[symbol + '_spot'] = spot;
+        const { rows, spot } = parseDhanOC(ocRes, expiry);
+        if (spot > 0 && !spotPrice) spotPrice = spot;
+        allRows.push(...rows);
+        console.log(`[Dhan OC] ${symbol} ${expiry}: ${rows.length} strikes, spot=${spot}`);
       } catch(e) {
         console.warn(`[Dhan OC] Expiry ${expiry} failed:`, e.message);
       }
@@ -305,7 +327,6 @@ app.get('/api/dhan/option-chain', async (req, res) => {
 
     if (!allRows.length) throw new Error('No option chain rows from Dhan');
 
-    const spotPrice = dhanOcCache[symbol + '_spot'] || 0;
     const nseFormat = {
       records: {
         underlyingValue: Math.round(spotPrice),
@@ -316,7 +337,7 @@ app.get('/api/dhan/option-chain', async (req, res) => {
     };
 
     dhanOcCache[symbol] = { data: nseFormat, ts: Date.now() };
-    console.log(`[Dhan OC] ${symbol}: ${allRows.length} rows, ${nseExpiries.length} expiries`);
+    console.log(`[Dhan OC] ${symbol}: ${allRows.length} rows, spot=${spotPrice}`);
     res.json(nseFormat);
 
   } catch(e) {

@@ -2821,6 +2821,277 @@ app.get('/api/yield-intel', async (req, res) => {
     res.json({ ok: false, error: e.message });
   }
 });
+
+// ── AI Engine — Claude-powered endpoints ─────────────────────────────────────
+// Rate limiting: track calls per user per day
+const aiCallTracker = {};  // uid -> { count, date }
+
+function checkAIRateLimit(uid) {
+  const today = new Date().toISOString().slice(0,10);
+  if (!aiCallTracker[uid] || aiCallTracker[uid].date !== today) {
+    aiCallTracker[uid] = { count: 0, date: today };
+  }
+  if (aiCallTracker[uid].count >= 20) return false;  // 20 calls/day limit
+  aiCallTracker[uid].count++;
+  return true;
+}
+
+async function callClaude(system, prompt, maxTokens=400) {
+  const CLAUDE_API_KEY = process.env.ANTHROPIC_API_KEY;
+  if (!CLAUDE_API_KEY) throw new Error('ANTHROPIC_API_KEY not configured');
+
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type':      'application/json',
+      'x-api-key':         CLAUDE_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model:      'claude-haiku-4-5-20251001',
+      max_tokens: maxTokens,
+      system,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+    signal: AbortSignal.timeout(15000),
+  });
+
+  if (!resp.ok) throw new Error(`Claude API error: ${resp.status}`);
+  const data = await resp.json();
+  return data?.content?.[0]?.text || '';
+}
+
+// Morning Brief
+app.post('/api/ai/morning-brief', async (req, res) => {
+  try {
+    const { regime, nifty, niftyChg, vix, pcr, fiiNet, giftPct, yield10y, yieldChg, curveStatus, lang, uid } = req.body;
+
+    // Rate limit
+    if (uid && !checkAIRateLimit(uid)) {
+      return res.json({ ok: false, error: 'Daily AI limit reached (20 briefs/day). Resets at midnight.' });
+    }
+
+    const langInstr = lang === 'hinglish'
+      ? 'Write in Hinglish (mix of Hindi and English, like how urban Indians actually speak). Use Hindi for emotion/context, English for financial terms. Example: "Aaj market cautiously bullish hai — lekin VIX elevated hai toh careful rehna."'
+      : lang === 'hindi'
+      ? 'Write entirely in Hindi (Devanagari script). Use simple language a retail trader from Tier 2 city would understand. Keep financial terms in English (CE, PE, VIX, etc).'
+      : 'Write in clear simple English. Avoid jargon. Explain what each number means for the trader.';
+
+    const prompt = `Current market data for Indian F&O trader:
+- Market Regime: ${regime}
+- Nifty 50: ${nifty} (${niftyChg > 0 ? '+' : ''}${niftyChg}% today)
+- India VIX: ${vix} ${vix > 20 ? '(danger zone)' : vix > 15 ? '(elevated)' : '(healthy)'}
+- PCR (Put/Call Ratio): ${pcr || 'not loaded'}
+- FII Net Flow: ${fiiNet ? '₹' + fiiNet + 'Cr' : 'not loaded'}
+- GIFT Nifty: ${giftPct > 0 ? '+' : ''}${giftPct}% (pre-market indicator)
+- US 10Y Yield: ${yield10y || 'N/A'}% (${yieldChg > 0 ? '+' : ''}${yieldChg || 0}% today)
+- US Yield Curve: ${curveStatus || 'unknown'}
+
+Write a morning brief for this retail F&O trader. Be like a smart, honest friend who trades — direct, no fluff, no false hope. Cover:
+1. What today's regime means in plain language (2-3 sentences max)
+2. The single biggest risk today (1-2 sentences)
+3. Specific strategy for today's conditions (2-3 sentences)
+4. Position sizing (1 sentence)
+
+${langInstr}
+
+150-200 words. Flowing paragraphs only. No bullet points. No "As an AI". No disclaimers.`;
+
+    const text = await callClaude(
+      'You are DeltaBuddy AI, a concise trading intelligence assistant for Indian retail F&O traders. Respond only with the brief text — no preamble, no sign-off.',
+      prompt, 400
+    );
+
+    res.json({ ok: true, text, generatedAt: new Date().toISOString() });
+  } catch(e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// Trade Validator
+app.post('/api/ai/validate-trade', async (req, res) => {
+  try {
+    const { strike, optType, lots, regime, vix, niftyChg, pcr, fiiNet, giftPct, uid } = req.body;
+
+    if (uid && !checkAIRateLimit(uid)) {
+      return res.json({ ok: false, error: 'Daily AI limit reached.' });
+    }
+
+    const prompt = `Indian F&O trader wants to place this trade:
+- Trade: ${lots} lot(s) ${strike} ${optType}
+- Current regime: ${regime}
+- India VIX: ${vix}
+- Nifty change today: ${niftyChg > 0 ? '+' : ''}${niftyChg}%
+- PCR: ${pcr || 'unknown'}
+- FII Flow: ${fiiNet ? '₹' + fiiNet + 'Cr' : 'unknown'}
+- GIFT Nifty: ${giftPct > 0 ? '+' : ''}${giftPct}%
+
+Validate this trade in Hinglish. Respond in this exact JSON format:
+{
+  "verdict": "ALIGNED" | "CAUTION" | "AGAINST_REGIME",
+  "risk_score": 1-10,
+  "analysis": "2-3 sentence analysis in Hinglish",
+  "suggestion": "Alternative trade suggestion if risky, in Hinglish. Empty string if trade is fine.",
+  "key_risks": ["risk1", "risk2"]
+}
+
+Be specific about numbers. If trade is against regime, explain exactly why. Respond ONLY with valid JSON.`;
+
+    const raw = await callClaude(
+      'You are DeltaBuddy AI trade validator. Respond ONLY with valid JSON, no other text.',
+      prompt, 300
+    );
+
+    let parsed;
+    try { parsed = JSON.parse(raw); }
+    catch(e) { parsed = { verdict: 'CAUTION', risk_score: 5, analysis: raw, suggestion: '', key_risks: [] }; }
+
+    res.json({ ok: true, ...parsed });
+  } catch(e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// Weekly Autopsy (called every Sunday or on demand)
+app.post('/api/ai/autopsy', async (req, res) => {
+  try {
+    const { trades, uid } = req.body;
+    // trades = [{ thesis, signal, entry, exit, pnl, regime, outcome }]
+
+    if (!trades || !trades.length) return res.json({ ok: false, error: 'No trades provided' });
+    if (uid && !checkAIRateLimit(uid)) return res.json({ ok: false, error: 'Daily AI limit reached.' });
+
+    const totalPnl    = trades.reduce((s,t) => s + (t.pnl||0), 0);
+    const wins        = trades.filter(t => t.pnl > 0);
+    const losses      = trades.filter(t => t.pnl < 0);
+    const alignedWins = wins.filter(t => t.regimeAligned);
+    const offLosses   = losses.filter(t => !t.regimeAligned);
+
+    const prompt = `Analyse this Indian F&O trader's last week trades and give a weekly autopsy in Hinglish:
+
+Summary:
+- Total trades: ${trades.length}
+- Net P&L: ₹${totalPnl}
+- Wins: ${wins.length}, Losses: ${losses.length}
+- Regime-aligned wins: ${alignedWins.length}
+- Off-regime losses: ${offLosses.length} (loss: ₹${offLosses.reduce((s,t)=>s+t.pnl,0)})
+
+Trades:
+${trades.map((t,i) => [(i+1), (t.optType||''), (t.strike||''), '| Regime:', t.regime, '| Aligned:', (t.regimeAligned?'Yes':'No'), '| P&L: Rs', t.pnl].join(' ')).join('\n')}
+')}
+
+Write a 150-word autopsy in Hinglish. Identify:
+1. The biggest pattern causing losses (be specific)
+2. What the trader is doing right
+3. One specific change that would improve results most
+
+Be like a tough but caring mentor. No fluff. Real numbers.`;
+
+    const text = await callClaude(
+      'You are DeltaBuddy AI trade coach. Write in Hinglish. Be direct and specific.',
+      prompt, 350
+    );
+
+    res.json({ ok: true, text, generatedAt: new Date().toISOString() });
+  } catch(e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+
+// ── Regime Change Monitor ─────────────────────────────────────────────────────
+// Checks market regime every 15 minutes during market hours
+// Fires Telegram alert when regime changes
+
+let lastKnownRegime = null;
+let lastRegimeAlertTime = 0;
+
+async function checkRegimeChange() {
+  try {
+    const nowUTC  = new Date();
+    const nowIST  = new Date(nowUTC.getTime() + 5.5 * 3600000);
+    const hourIST = nowIST.getUTCHours() + nowIST.getUTCMinutes() / 60;
+
+    // Only during market hours 9:00 AM - 3:45 PM IST
+    if (hourIST < 9.0 || hourIST > 15.75) return;
+
+    // Fetch required data
+    const [vixData, fiiData] = await Promise.all([
+      fetchYahooTicker('^NSEI').catch(()=>null),
+      fetchYahooTicker('USDINR=X').catch(()=>null), // proxy for FII pressure
+    ]);
+
+    const vix      = vixData?.price || 0;
+    const niftyChg = vixData?.changePct || 0;
+
+    // Simple regime calculation (server-side, no option chain available)
+    // Uses VIX + Nifty direction + USD/INR as FII proxy
+    let score = 0;
+    if (vix > 0) score += vix < 14 ? 1 : vix < 20 ? 0 : -1;
+    if (niftyChg > 0.3) score += 1;
+    else if (niftyChg < -0.3) score -= 1;
+
+    const regime = score >= 2 ? 'BULL TREND'
+      : score >= 0 ? 'VOLATILE BULL'
+      : score >= -1 ? 'BEAR PRESSURE' : 'CHAOS';
+
+    // Detect regime change
+    if (lastKnownRegime && regime !== lastKnownRegime) {
+      const timeSinceLast = Date.now() - lastRegimeAlertTime;
+      if (timeSinceLast < 60 * 60000) return; // max 1 alert per hour
+
+      lastRegimeAlertTime = Date.now();
+
+      const emoji = regime === 'BULL TREND' ? '🟢'
+        : regime === 'VOLATILE BULL' ? '🟡'
+        : regime === 'BEAR PRESSURE' ? '🟠' : '🔴';
+
+      const action = regime === 'BULL TREND'
+        ? 'Full size allowed. Trend-following strategies.'
+        : regime === 'VOLATILE BULL'
+        ? 'Reduce to 50% size. Spreads only — no naked buying.'
+        : regime === 'BEAR PRESSURE'
+        ? 'Reduce to 25% size. Hedge mandatory. Avoid longs.'
+        : 'EXIT all positions. Cash only. Market is unstable.';
+
+      const msg = [
+        `${emoji} *DeltaBuddy — Regime Change Alert*`,
+        ``,
+        `*${lastKnownRegime}* → *${regime}*`,
+        ``,
+        `📌 *Action:* ${action}`,
+        ``,
+        `_VIX: ${vix.toFixed(1)} | Nifty: ${niftyChg > 0 ? '+' : ''}${niftyChg.toFixed(2)}%_`,
+        `_Time: ${nowIST.toLocaleTimeString('en-IN')} IST_`,
+      ].join('\n');
+
+      const subs = getSubscribers();
+      let sent = 0;
+      for (const chatId of subs) {
+        try {
+          await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, text: msg, parse_mode: 'Markdown' }),
+          });
+          sent++;
+        } catch(e) {}
+      }
+      console.log(`[Regime] Changed ${lastKnownRegime}→${regime}. Alerted ${sent} users.`);
+    }
+
+    lastKnownRegime = regime;
+  } catch(e) {
+    console.error('[Regime Monitor]', e.message);
+  }
+}
+
+function startRegimeMonitor() {
+  setInterval(checkRegimeChange, 15 * 60 * 1000); // every 15 min
+  setTimeout(checkRegimeChange, 30000); // first check after 30s
+  console.log('[Regime Monitor] Started — checks every 15 min during market hours');
+}
+
 app.listen(PORT, () => {
   console.log(`\n🚀 DeltaBuddy Backend on port ${PORT}`);
   console.log(`💼 Dhan Status:    http://localhost:${PORT}/api/dhan/status`);
@@ -2830,6 +3101,7 @@ app.listen(PORT, () => {
   getNSECookies();
   startAlertEngine();
   startPremarketMonitor();
+  startRegimeMonitor();
 
   // Load subscribers from Firestore then refresh every 5 minutes
   loadSubscribersFromFirestore();

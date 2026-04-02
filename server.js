@@ -119,11 +119,55 @@ app.delete('/api/dhan/order/:orderId', async (req, res) => {
 // ── DHAN OPTION CHAIN ────────────────────────────────────────────────────────
 // Dhan API option chain — reliable, works from cloud, uses existing credentials
 const DHAN_OC_SCRIPS = {
-  NIFTY:      { scrip: 13,  seg: 'IDX_I' },
-  BANKNIFTY:  { scrip: 25,  seg: 'IDX_I' },
-  FINNIFTY:   { scrip: 27,  seg: 'IDX_I' },
-  MIDCPNIFTY: { scrip: 442, seg: 'IDX_I' },
-  SENSEX:     { scrip: 51,  seg: 'IDX_I' },
+  // Indices (IDX_I segment)
+  NIFTY:      { scrip: 13,    seg: 'IDX_I' },
+  BANKNIFTY:  { scrip: 25,    seg: 'IDX_I' },
+  FINNIFTY:   { scrip: 27,    seg: 'IDX_I' },
+  MIDCPNIFTY: { scrip: 442,   seg: 'IDX_I' },
+  SENSEX:     { scrip: 51,    seg: 'IDX_I' },
+  // F&O Stocks (NSE_EQ segment) — NSE Security IDs
+  RELIANCE:   { scrip: 2885,  seg: 'NSE_EQ' },
+  TCS:        { scrip: 11536, seg: 'NSE_EQ' },
+  HDFCBANK:   { scrip: 1333,  seg: 'NSE_EQ' },
+  ICICIBANK:  { scrip: 4963,  seg: 'NSE_EQ' },
+  INFY:       { scrip: 1594,  seg: 'NSE_EQ' },
+  SBIN:       { scrip: 3045,  seg: 'NSE_EQ' },
+  AXISBANK:   { scrip: 5900,  seg: 'NSE_EQ' },
+  ITC:        { scrip: 1660,  seg: 'NSE_EQ' },
+  BAJFINANCE: { scrip: 317,   seg: 'NSE_EQ' },
+  WIPRO:      { scrip: 3787,  seg: 'NSE_EQ' },
+  LT:         { scrip: 11483, seg: 'NSE_EQ' },
+  HINDUNILVR: { scrip: 1394,  seg: 'NSE_EQ' },
+  KOTAKBANK:  { scrip: 1922,  seg: 'NSE_EQ' },
+  BHARTIARTL: { scrip: 10604, seg: 'NSE_EQ' },
+  ASIANPAINT: { scrip: 236,   seg: 'NSE_EQ' },
+  MARUTI:     { scrip: 10999, seg: 'NSE_EQ' },
+  TATAMOTORS: { scrip: 3456,  seg: 'NSE_EQ' },
+  TATASTEEL:  { scrip: 3499,  seg: 'NSE_EQ' },
+  ADANIPORTS: { scrip: 15083, seg: 'NSE_EQ' },
+  POWERGRID:  { scrip: 14977, seg: 'NSE_EQ' },
+  NTPC:       { scrip: 11630, seg: 'NSE_EQ' },
+  ONGC:       { scrip: 2475,  seg: 'NSE_EQ' },
+  JSWSTEEL:   { scrip: 11723, seg: 'NSE_EQ' },
+  SUNPHARMA:  { scrip: 3351,  seg: 'NSE_EQ' },
+  DRREDDY:    { scrip: 881,   seg: 'NSE_EQ' },
+  CIPLA:      { scrip: 694,   seg: 'NSE_EQ' },
+  HCLTECH:    { scrip: 7229,  seg: 'NSE_EQ' },
+  TECHM:      { scrip: 13538, seg: 'NSE_EQ' },
+  BAJAJ_AUTO: { scrip: 16669, seg: 'NSE_EQ' },
+  BAJAJFINSV: { scrip: 16675, seg: 'NSE_EQ' },
+  TITAN:      { scrip: 3506,  seg: 'NSE_EQ' },
+  ULTRACEMCO: { scrip: 11532, seg: 'NSE_EQ' },
+  HINDALCO:   { scrip: 1363,  seg: 'NSE_EQ' },
+  COALINDIA:  { scrip: 20374, seg: 'NSE_EQ' },
+  DIVISLAB:   { scrip: 10940, seg: 'NSE_EQ' },
+  APOLLOHOSP: { scrip: 157,   seg: 'NSE_EQ' },
+  EICHERMOT:  { scrip: 910,   seg: 'NSE_EQ' },
+  INDUSINDBK: { scrip: 5258,  seg: 'NSE_EQ' },
+  TATACONSUM: { scrip: 3432,  seg: 'NSE_EQ' },
+  VEDL:       { scrip: 3063,  seg: 'NSE_EQ' },
+  BPCL:       { scrip: 526,   seg: 'NSE_EQ' },
+  HEROMOTOCO: { scrip: 1348,  seg: 'NSE_EQ' },
 };
 
 // Cache 60s
@@ -1169,36 +1213,52 @@ async function askAI(prompt, groqModel = 'llama-3.1-8b-instant') {
 // ── ALERT ENGINE — RSS-based, AI-first smart filtering ────────────────────────
 
 const RSS_FEEDS = [
-  // Reuters — globally accessible, finance-focused
+  // Reuters — fastest international wire
   'https://feeds.reuters.com/reuters/businessNews',
   'https://feeds.reuters.com/reuters/INtopNews',
-  // Financial Times RSS
-  'https://www.ft.com/rss/home/uk',
-  // Yahoo Finance India
-  'https://finance.yahoo.com/rss/2.0/headline?s=^NSEI&region=IN&lang=en-IN',
-  // Investing.com India news
-  'https://www.investing.com/rss/news_25.rss',
+  // Economic Times — fastest Indian financial news
+  'https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms',
+  'https://economictimes.indiatimes.com/rssfeedstopstories.cms',
+  // Moneycontrol — most used by Indian traders
+  'https://www.moneycontrol.com/rss/latestnews.xml',
+  'https://www.moneycontrol.com/rss/marketreports.xml',
+  // Live Mint
+  'https://www.livemint.com/rss/markets',
+  // Business Standard
+  'https://www.business-standard.com/rss/markets-106.rss',
   // NDTV Business
   'https://feeds.feedburner.com/ndtvprofit-latest',
+  // Investing.com India
+  'https://www.investing.com/rss/news_25.rss',
 ];
 
 // First-pass filter — only pass news that could plausibly move markets
 const BROAD_RELEVANCE_KEYWORDS = [
   // Indian indices & regulators
-  'nifty','sensex','nse','bse','rbi','sebi',
+  'nifty','sensex','nse','bse','rbi','sebi','irdai',
+  // RBI specific actions — highest priority
+  'repo rate','reverse repo','crr','slr','monetary policy','mpc meeting',
+  'rbi governor','rbi circular','rbi directive','rbi ban','rbi curb',
+  'forex reserve','foreign exchange','rupee','inr','dollar',
+  'fpi limit','fii limit','fdi policy','capital flows',
   // Global macro
-  'fed reserve','federal reserve','interest rate','repo rate','inflation','gdp',
+  'fed reserve','federal reserve','interest rate','inflation','gdp',
   'imf','world bank','opec','oil price','crude oil','crude price',
-  // Geopolitical at country/global level only
+  'us jobs','payroll','cpi','ppi','ecb rate','boj rate',
+  // Geopolitical
   'war','airstrike','missile','nuclear','sanctions','trade war','tariff',
   'iran','russia','ukraine','china','pakistan','nato','israel',
-  // Heavy-weight stocks — only major news
+  // Heavy-weight stocks
   'reliance industries','adani group','adani enterprises','tata group',
-  'hdfc bank','icici bank','sbi bank','infosys','wipro',
+  'hdfc bank','icici bank','state bank','infosys','wipro',
+  'tcs','bajaj finance','maruti','tata motors','larsen',
   // Market events
-  'market crash','circuit breaker','trading halt','stock market',
-  'fii','dii','foreign investor','rupee falls','rupee crashes',
-  'default','bankruptcy','fraud','scam','ponzi',
+  'market crash','circuit breaker','trading halt','upper circuit','lower circuit',
+  'fii selling','fii buying','foreign investor','bulk deal','block deal',
+  'default','bankruptcy','fraud','scam','ponzi','promoter pledge',
+  'earnings','quarterly results','profit','loss','revenue',
+  'merger','acquisition','buyback','dividend','bonus shares','rights issue',
+  'ipo','listing','delisted',
 ];
 
 // Hard block — these topics can NEVER be market-moving regardless of keywords
@@ -1552,7 +1612,7 @@ async function runAlertEngine(isStartup = false) {
 
     console.log(`[Alerts] Score ${ai.score}/10 (${ai.impact}): ${item.title}`);
 
-    if (ai.score < 7) continue; // below threshold — skip silently
+    if (ai.score < 6) continue; // below threshold — skip silently
 
     // Format and send
     const emoji = ai.impact === 'bearish' ? '🔴' : ai.impact === 'bullish' ? '🟢' : '🟡';
@@ -1589,7 +1649,13 @@ function startAlertEngine() {
   console.log('[Alerts] Engine starting...');
   runAlertEngine(true).then(() => {
     console.log('[Alerts] Watching for breaking news every 3 minutes.');
-    setInterval(() => runAlertEngine(false), 3 * 60 * 1000);
+    // During market hours (9 AM - 4 PM IST) check every 90s, else every 5 min
+    setInterval(() => {
+      const nowIST = new Date(Date.now() + 5.5 * 3600000);
+      const h = nowIST.getUTCHours() + nowIST.getUTCMinutes()/60;
+      const isMarketHours = h >= 9.0 && h <= 16.0;
+      if (isMarketHours || Math.random() < 0.3) runAlertEngine(false);
+    }, 90 * 1000);
   });
 }
 

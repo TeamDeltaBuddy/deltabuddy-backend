@@ -2132,11 +2132,15 @@ app.get('/api/rzp/subscription/:subId', async (req, res) => {
 });
 
 
-app.get('/api/health', (req, res) => {
+app.get('/api/health', async (req, res) => {
+  if (!dhanTokenChecked || Date.now() - dhanTokenChecked > 5 * 60000) {
+    await checkDhanToken();
+  }
   res.json({
     status        : 'ok',
     service       : 'DeltaBuddy Backend',
     dhanConfigured: !!(DHAN_CLIENT_ID && DHAN_ACCESS_TOKEN),
+    dhanTokenValid: dhanTokenValid,
     uptime        : Math.floor(process.uptime()) + 's',
     timestamp     : new Date().toISOString(),
   });
@@ -2695,6 +2699,43 @@ async function checkPremarketGiftNifty() {
   }
 }
 
+async function checkDhanTokenAndAlert() {
+  try {
+    const nowIST = new Date(Date.now() + 5.5 * 3600000);
+    const h = nowIST.getUTCHours() + nowIST.getUTCMinutes()/60;
+    if (h < 8.3 || h > 8.8) return; // only between 8:18 - 8:48 AM IST
+
+    const r = await dhanAPI('/v2/fundlimit');
+    const expired = r?.status === 'failed' || JSON.stringify(r).includes('Authentication Failed');
+    if (expired) {
+      const subs = getSubscribers();
+      const msg = [
+        '🔑 <b>DeltaBuddy — Dhan Token Expired</b>',
+        '',
+        'Aapka Dhan access token expire ho gaya hai.',
+        'Option chain aur stock data kaam nahi karega.',
+        '',
+        '👇 <b>Abhi renew karo:</b>',
+        '1. Dhan app/website → API section',
+        '2. Generate new access token',
+        '3. Railway → Variables → DHAN_ACCESS_TOKEN update karo',
+        '',
+        '⏰ Market 9:15 AM pe open hoga. Pehle update kar lo.',
+      ].join('\n');
+      for (const chatId of subs) {
+        try {
+          await fetch(`https://api.telegram.org/bot${process.env.TG_BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, text: msg, parse_mode: 'HTML' }),
+          });
+        } catch(e) {}
+      }
+      console.log('[Dhan] Token expired alert sent to', subs.length, 'users');
+    }
+  } catch(e) {}
+}
+
 function startPremarketMonitor() {
   // Check every 5 minutes
   setInterval(checkPremarketGiftNifty, 5 * 60 * 1000);
@@ -3205,6 +3246,7 @@ app.listen(PORT, () => {
   getNSECookies();
   startAlertEngine();
   startPremarketMonitor();
+  setInterval(checkDhanTokenAndAlert, 10 * 60 * 1000); // check every 10 min
   startRegimeMonitor();
 
   // Load subscribers from Firestore then refresh every 5 minutes

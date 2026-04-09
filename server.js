@@ -2679,7 +2679,7 @@ async function checkPremarketGiftNifty() {
       ].join('\n');
 
       // Send to all subscribers
-      const subs = getSubscribers();
+      const subs = [...alertSubscribers];
       console.log(`[Pre-Market] GIFT Nifty ${pct}% — alerting ${subs.length} subscribers`);
 
       let sent = 0;
@@ -2709,7 +2709,7 @@ async function checkDhanTokenAndAlert() {
     const r = await dhanAPI('/v2/fundlimit');
     const expired = r?.status === 'failed' || JSON.stringify(r).includes('Authentication Failed');
     if (expired) {
-      const subs = getSubscribers();
+      const subs = [...alertSubscribers];
       const msg = [
         '🔑 <b>DeltaBuddy — Dhan Token Expired</b>',
         '',
@@ -2930,7 +2930,7 @@ app.get('/api/yield-intel', async (req, res) => {
         `_US 10Y: ${y10.toFixed(2)}% | Spread: ${spread_10_2}% | USD/INR: ${raw.usdinr?.price || 'N/A'}_`,
       ].join('\n');
 
-      const subs = getSubscribers();
+      const subs = [...alertSubscribers];
       for (const chatId of subs) {
         try {
           await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -3211,7 +3211,7 @@ async function checkRegimeChange() {
         `_Time: ${nowIST.toLocaleTimeString('en-IN')} IST_`,
       ].join('\n');
 
-      const subs = getSubscribers();
+      const subs = [...alertSubscribers];
       let sent = 0;
       for (const chatId of subs) {
         try {

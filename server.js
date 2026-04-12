@@ -12,7 +12,7 @@ const rateLimit = require('express-rate-limit');
 
 const app  = express();
 app.set('trust proxy', 1);
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 app.use(cors({ origin: '*', methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Authorization','x-groq-key'] }));
@@ -3253,12 +3253,4 @@ app.listen(PORT, () => {
   // Load subscribers from Firestore then refresh every 5 minutes
   loadSubscribersFromFirestore();
   setInterval(loadSubscribersFromFirestore, 5 * 60 * 1000);
-
-  // ── Keep-alive ping so Render free tier never sleeps ──────────────────
-  const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
-  setInterval(() => {
-    fetch(`${SELF_URL}/api/health`)
-      .then(() => console.log('[Keep-alive] ping ok'))
-      .catch(() => {});
-  }, 10 * 60 * 1000); // every 10 minutes
 });

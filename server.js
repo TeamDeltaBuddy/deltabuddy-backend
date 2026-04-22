@@ -12,6 +12,22 @@ const rateLimit = require('express-rate-limit');
 
 const app  = express();
 app.set('trust proxy', 1);
+
+// Dhan token validity tracking
+let dhanTokenValid = null;
+let dhanTokenChecked = 0;
+
+async function checkDhanToken() {
+  try {
+    const r = await dhanAPI('/v2/fundlimit');
+    dhanTokenValid = !(r?.status === 'failed' || JSON.stringify(r||'').includes('Authentication Failed'));
+    dhanTokenChecked = Date.now();
+  } catch(e) {
+    dhanTokenValid = false;
+    dhanTokenChecked = Date.now();
+  }
+}
+
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
